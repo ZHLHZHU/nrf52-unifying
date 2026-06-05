@@ -160,6 +160,24 @@ python3 tools/unifying.py key 0x4C          # 直接给 HID 键码(十六进制)
 
 也可以直接给十六进制 USB HID 键码,如 `0x4C`(Delete)。
 
+### keydown — 发送按键(不自动释放)
+
+发送一帧 HID 报文,**只发按下,不自动释放**。适用于 KVM 等程序化调用场景,由调用方负责状态管理和发送释放帧。
+
+```bash
+python3 tools/unifying.py raw "UKEYDOWN 00 04"    # 按下 'a'
+python3 tools/unifying.py raw "UKEYDOWN 02 04"    # Shift + 'a'(= 'A')
+python3 tools/unifying.py raw "UKEYDOWN 00"       # 释放所有键(发送空报文)
+```
+
+与 `UKEY` 的区别:
+- `UKEY` 自动做 press + release 两帧(适合单次按键)
+- `UKEYDOWN` 只发送当前帧的完整状态(适合状态式转发)
+
+典型用法:KVM 转发器维护当前按下键集合,每次状态变化发一次 `UKEYDOWN`。这样多个键重叠按下/释放时不会因为 `UKEY` 的自动释放导致重复按键。
+
+`UKEYDOWN` 每 128 帧自动持久化 AES counter,无需调用方额外处理。
+
 ### status — 查看状态
 
 ```bash

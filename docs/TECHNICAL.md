@@ -12,7 +12,7 @@ graph TD
     FW["nRF52840 固件 (app/)<br/>main.rs — 单 embassy 执行器, join(usb_fut, serial_fut)"]
     Serial["serial_fut: 命令分发 + 后台 keep-alive (select)"]
     OTA["OTA 协议 (PING/INFO/WRITE/BOOT/...)"]
-    Unifying["Unifying 协议 (UPAIR/UCONNECT/UTYPE/UKEY/...)"]
+    Unifying["Unifying 协议 (UPAIR/UCONNECT/UTYPE/UKEY/UKEYDOWN/...)"]
     Lib["rust-unifying (no_std lib)<br/>UnifyingDevice&lt;R,C,E&gt; — 协议状态机/配对/加密键击<br/>trait UnifyingRadio | trait Clock | trait AesEncryptor"]
     ESB["esb_radio.rs — EsbRadio<br/>(片上 RADIO/ESB)"]
     Clock["unifying_hal.rs — EmbassyClock<br/>(embassy-time)"]
@@ -314,22 +314,26 @@ ASCII 行命令,`\n` 结尾。与原脚手架字节级兼容:
 | 命令 | 行为 | 回复 |
 | --- | --- | --- |
 | `VER` | 协议版本 + build | `VER unifying/1 build=...` |
-| `UPAIR` | 与配对模式的接收机配对(重试 8 轮),保存到 flash | `PAIRED <addr-hex> CH=<n>` / `ERR PAIR` |
+| `UPAIR <slot>` | 与配对模式的接收机配对(重试 8 轮),保存到指定 slot(0-3) | `PAIRED <addr-hex> CH=<n>` / `ERR PAIR` |
 | `UCONNECT` | 用已存配对唤醒/连接(重试 60 次) | `CONNECTED CH=<n>` / `ERR CONNECT` |
+| `USWITCH <slot>` | 切换到指定 profile slot(0-3),加载配对并自动连接 | `SWITCHED <slot> CONNECTED` / `SWITCHED <slot> NOCONN` |
 | `UTYPE <text>` | 把文本逐字符当键击发送,保存递增 counter | `TYPED <ok>/<total>` |
 | `UKEY <mod> [keys...]` | 发一帧原始 HID(modifier + 至多 6 个 hex 键码)再释放 | `OK` / `ERR SEND` |
+| `UKEYDOWN <mod> [keys...]` | 只发按下报文(不自动释放)。用于 KVM 状态式转发 | `OK` / `ERR SEND` |
 | `UKEEPALIVE` | 手动发一次保活 | `TICK` |
 | `USTATUS` | 状态报告 | `STATUS PAIRED=.. CONN=.. CH=.. CNT=..` |
-| `UDELETE` | 擦除已存配对 | `DELETED` |
+| `UDELETE <slot>` | 擦除指定 slot 的配对信息 | `DELETED` |
 | 未知 | 命令列表 | `UCMDS: ...` |
 
 `UTYPE`/`UKEY` 发送前先 `tick()` 几次稳定链路;`type_char`/`send_key_report` 做 press → release 两帧,内层 `press_key` 对每帧重试至多 20 次(失败时换信道)。
+
+`UKEYDOWN` 只发按下报文(不发释放),适用于 KVM 等需要状态式转发的场景。每次调用发送当前完整 HID 状态(modifier + keys),由调用方负责发送全零帧释放。`UKEYDOWN` 每 128 帧自动持久化一次 AES counter(见下文)。
 
 ---
 
 ## 7. 持久化存储
 
-`app/src/storage.rs`。配对信息存入 STORAGE 分区(`0xF8000`,32K),使配对在复位/OTA 后存活。
+`app/src/storage.rs`。配对信息存入 STORAGE 分区(`0xF8000`,32K),使配对在复位/OTA 后存活。支持 4 个独立 profile slot,每个 slot 占一页 flash。
 
 ### 7.1 记录格式(32 字节,4 字节对齐)
 
@@ -342,22 +346,58 @@ ASCII 行命令,`\n` 结尾。与原脚手架字节级兼容:
 [28..32] aes_counter (u32 小端)
 ```
 
-### 7.2 追加式日志(降低 flash 磨损)
+### 7.2 Flash 布局(多 Profile)
 
-STORAGE 首页 4K 分为 128 个 32 字节槽位。每次 `save()` 追加一条记录到第一个空槽(擦除后的 flash 读作 `0xFFFFFFFF`,与 magic 不同,易于判空);写满 128 槽才擦整页重来。`load()` 顺序扫描,返回最后一条有效记录。`clear()` 擦整页(UDELETE)。
+| 页 | 地址 | 用途 |
+| --- | --- | --- |
+| Page 0 | `0xF8000` | Profile slot 0(追加日志,128 条记录) |
+| Page 1 | `0xF9000` | Profile slot 1 |
+| Page 2 | `0xFA000` | Profile slot 2 |
+| Page 3 | `0xFB000` | Profile slot 3 |
+| Page 4 | `0xFC000` | Active-slot metadata(追加日志,1024 条 4 字节记录) |
+| Pages 5-7 | `0xFD000`-`0xFF000` | Reserved |
 
-### 7.3 AES counter 的安全性
+每个 profile slot 页为独立的追加式日志(4K / 32B = 128 个槽位)。Active-slot metadata 页记录当前活跃 slot 编号(4K / 4B = 1024 条),写满才擦页重来。
+
+### 7.3 追加式日志(降低 flash 磨损)
+
+每个 slot 页 4K 分为 128 个 32 字节槽位。每次 `save()` 追加一条记录到第一个空槽(擦除后的 flash 读作 `0xFFFFFFFF`,与 magic 不同,易于判空);写满 128 槽才擦整页重来。`load()` 顺序扫描,返回最后一条有效记录。`clear()` 擦整页(UDELETE)。
+
+### 7.4 AES counter 的安全性
 
 `aes_counter` 是接收机的防重放计数,**复位后必须续用更大的值**,否则键击因"counter 已见过"被拒。因此:
 
 - `UPAIR` 成功后保存完整 profile。
 - 每次 `UTYPE`/`UKEY` 后保存递增后的 counter。
+- `UKEYDOWN` 每 128 帧(counter & 0x7F == 0)自动持久化一次。
 
 `UnifyingDevice` 的 `aes_counter` 字段语义是"下一个要用的值",所以保存它、重启赋回,永不重用。
 
-### 7.4 flash 句柄共享
+### 7.5 flash 句柄共享
 
 STORAGE 与固件更新器复用同一个 `Mutex<NoopRawMutex, RefCell<Nvmc>>`。单 embassy 执行器顺序访问,`.lock()` 不会嵌套,安全。STORAGE 分区在更新器管辖的 DFU/STATE 分区之外,互不干扰。Nvmc 使用**绝对地址**(`0xF8000`),写需 4 字节对齐,擦需页对齐。
+
+---
+
+## AES Counter 保护机制
+
+AES counter 的持久化采用三重保护,确保断电、异常复位等场景下 counter 永远不会回退:
+
+### 启动前跳 +512
+
+每次从 flash 加载 counter 后立即加 512 并写回。覆盖断电前未持久化的增量。接收器接受任何严格大于已见值的 counter(无上限窗口),所以跳过 512 无害。
+
+### 周期存储
+
+`UKEYDOWN` 每 128 帧(counter & 0x7F == 0)自动持久化一次。正常打字约每 10-30 秒触发一次写入。`UTYPE`/`UKEY` 在 burst 结束后保存。
+
+### 掉电紧急存储(POFCON)
+
+启动时启用 nRF52840 POWER.POFCON(阈值 2.7V)。保活 tick 每 8ms 检查 `events_pofwarn`,检测到则紧急写入当前 counter。USB 拔线时 VDD 从 3.3V 下降,板上电容提供几百μs 窗口,够写一条 32 字节记录(~330μs)。
+
+### 最坏情况
+
+即使 POFWARN 也没来得及(如瞬间短路),启动时 +512 已覆盖。对 u32(40 亿)而言 512 的损耗完全可忽略。
 
 ---
 
