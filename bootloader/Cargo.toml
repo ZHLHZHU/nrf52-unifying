@@ -1,0 +1,13 @@
+[package]
+name = "nrf-demo-bootloader"
+version = "0.1.0"
+edition = "2021"
+publish = false
+build = "build.rs"
+
+[dependencies]
+cortex-m = { version = "0.7.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7.5"
+embassy-boot-nrf = "0.11.0"
+embassy-nrf = { version = "0.10.0", features = ["nrf52840"] }
+embassy-sync = "0.8.0"

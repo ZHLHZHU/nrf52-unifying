@@ -1,0 +1,14 @@
+[workspace]
+members = ["bootloader", "app"]
+default-members = ["app"]
+resolver = "2"
+
+[profile.dev]
+debug = 2
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1
+debug = 2
+lto = true
+opt-level = "s"
