@@ -189,10 +189,7 @@ async fn main(_spawner: Spawner) {
         unifying.active_slot = slot;
         if let Some(mut profile) = storage::load(&flash, slot) {
             // Safety margin: jump counter forward to cover any un-persisted
-            // keystrokes from before a crash/power-loss. The receiver accepts
-            // any counter strictly greater than its last-seen value (no upper
-            // window), so skipping 512 is harmless but guarantees we won't
-            // replay values it already saw.
+            // keystrokes from before a crash/power-loss.
             profile.aes_counter = profile.aes_counter.wrapping_add(512);
             unifying.apply_profile(&profile);
             storage::save(&flash, slot, &profile);
@@ -585,6 +582,24 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
         return;
     }
 
+    // USLEEP — stop keep-alive and disable the radio. The link to the receiver
+    // will drop (receiver sees device go offline). Use when the KVM switches to
+    // local mode and there's no need to maintain a remote connection. USWITCH
+    // or UCONNECT will wake everything back up.
+    if line == b"USLEEP" {
+        if state.connected {
+            state.connected = false;
+            // Disable the RADIO peripheral to save power.
+            pac::RADIO.tasks_disable().write_value(1);
+            // Persist counter before sleeping (in case we don't wake for a while).
+            if state.paired {
+                storage::save(flash, state.active_slot, &state.current_profile());
+            }
+        }
+        let _ = write_reply(class, b"SLEEP\r\n").await;
+        return;
+    }
+
     if line == b"USTATUS" {
         let mut out = [0u8; 96];
         let n = format_status(&mut out, state);
@@ -806,7 +821,7 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
 
     let _ = write_reply(
         class,
-        b"UCMDS: VER UPAIR [slot] UCONNECT UTYPE <text> UKEY <mod> [keys] USWITCH <slot> UKEEPALIVE USTATUS UDELETE [slot]\r\n",
+        b"UCMDS: VER UPAIR [slot] UCONNECT UTYPE <text> UKEY <mod> [keys] UKEYDOWN <mod> [keys] USWITCH <slot> USLEEP UKEEPALIVE USTATUS UDELETE [slot]\r\n",
     )
     .await;
 }
