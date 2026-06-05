@@ -34,7 +34,7 @@ use rust_unifying::{PairingParams, UnifyingDevice};
 
 use esb_radio::EsbRadio;
 use keymap::char_to_hid;
-use storage::{Profile, SharedFlash};
+use storage::{Profile, SharedFlash, MAX_PROFILES};
 use unifying_hal::{EmbassyClock, SwAesCtr};
 
 bind_interrupts!(struct Irqs {
@@ -59,6 +59,8 @@ struct UnifyingState {
     device: Device,
     paired: bool,
     connected: bool,
+    /// Currently active profile slot (0..MAX_PROFILES).
+    active_slot: u8,
 }
 
 impl UnifyingState {
@@ -78,6 +80,7 @@ impl UnifyingState {
             device,
             paired: false,
             connected: false,
+            active_slot: 0,
         }
     }
 
@@ -88,6 +91,7 @@ impl UnifyingState {
         self.device.aes_counter = p.aes_counter;
         self.device.channel = p.channel;
         self.paired = true;
+        self.connected = false;
     }
 
     /// Snapshot the current pairing for persistence.
@@ -97,6 +101,21 @@ impl UnifyingState {
             aes_key: self.device.aes_key,
             aes_counter: self.device.aes_counter,
             channel: self.device.channel,
+        }
+    }
+
+    /// Switch to a different profile slot and load it from flash.
+    /// Returns true if the slot has a stored pairing.
+    fn switch_to(&mut self, flash: &SharedFlash<'_>, slot: u8) -> bool {
+        self.connected = false;
+        self.active_slot = slot;
+        storage::save_active_slot(flash, slot);
+        if let Some(profile) = storage::load(flash, slot) {
+            self.apply_profile(&profile);
+            true
+        } else {
+            self.paired = false;
+            false
         }
     }
 }
@@ -156,7 +175,14 @@ async fn main(_spawner: Spawner) {
     }
 
     let mut unifying = UnifyingState::new();
-    if let Some(profile) = storage::load(&flash) {
+    // Restore persisted active slot and its profile from flash.
+    if let Some(slot) = storage::load_active_slot(&flash) {
+        unifying.active_slot = slot;
+        if let Some(profile) = storage::load(&flash, slot) {
+            unifying.apply_profile(&profile);
+        }
+    } else if let Some(profile) = storage::load(&flash, 0) {
+        // Backward compat: no active-slot stored, try slot 0.
         unifying.apply_profile(&profile);
     }
 
@@ -434,7 +460,20 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
         return;
     }
 
-    if line == b"UPAIR" {
+    if line == b"UPAIR" || line.starts_with(b"UPAIR ") {
+        // UPAIR [slot] — pair into specified slot (default: current active_slot).
+        let slot = if line.len() > 6 {
+            match parse_u8_hex(&line[6..]) {
+                Some(s) if s < MAX_PROFILES => s,
+                _ => {
+                    let _ = write_reply(class, b"ERR SLOT\r\n").await;
+                    return;
+                }
+            }
+        } else {
+            state.active_slot
+        };
+
         let params = PairingParams {
             id: (embassy_time::Instant::now().as_ticks() as u8) | 0x01,
             product_id: 0x1025,
@@ -466,9 +505,10 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
         if paired {
             state.paired = true;
             state.connected = true;
-            // Persist the new pairing (address, AES key, channel, counter) so
-            // it survives resets and OTA updates.
-            storage::save(flash, &state.current_profile());
+            state.active_slot = slot;
+            // Persist the new pairing into the specified slot.
+            storage::save(flash, slot, &state.current_profile());
+            storage::save_active_slot(flash, slot);
             let mut out = [0u8; 64];
             let n = format_paired(&mut out, &state.device.address, state.device.channel);
             let _ = write_reply(class, &out[..n]).await;
@@ -532,11 +572,70 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
         return;
     }
 
-    if line == b"UDELETE" {
-        storage::clear(flash);
-        state.paired = false;
-        state.connected = false;
-        let _ = write_reply(class, b"DELETED\r\n").await;
+    if line == b"UDELETE" || line.starts_with(b"UDELETE ") {
+        // UDELETE [slot] — erase a specific slot, or all if no arg.
+        if line.len() > 8 {
+            match parse_u8_hex(&line[8..]) {
+                Some(s) if s < MAX_PROFILES => {
+                    storage::clear_slot(flash, s);
+                    if state.active_slot == s {
+                        state.paired = false;
+                        state.connected = false;
+                    }
+                    let _ = write_reply(class, b"DELETED\r\n").await;
+                }
+                _ => {
+                    let _ = write_reply(class, b"ERR SLOT\r\n").await;
+                }
+            }
+        } else {
+            storage::clear_all(flash);
+            state.paired = false;
+            state.connected = false;
+            let _ = write_reply(class, b"DELETED ALL\r\n").await;
+        }
+        return;
+    }
+
+    // USWITCH <id> — switch active profile slot (0..3), load + reconnect.
+    if let Some(rest) = line.strip_prefix(b"USWITCH ") {
+        match parse_u8_hex(rest) {
+            Some(slot) if slot < MAX_PROFILES => {
+                let has_profile = state.switch_to(flash, slot);
+                if has_profile {
+                    // Auto-reconnect on the new profile.
+                    if state.device.configure_radio().is_ok() {
+                        let mut ok = false;
+                        for _ in 0..30 {
+                            if state.device.connect().is_ok() {
+                                ok = true;
+                                break;
+                            }
+                            Timer::after(Duration::from_millis(20)).await;
+                        }
+                        if ok {
+                            state.connected = true;
+                            let mut out = [0u8; 48];
+                            let n = format_switched(&mut out, slot, true);
+                            let _ = write_reply(class, &out[..n]).await;
+                        } else {
+                            let mut out = [0u8; 48];
+                            let n = format_switched(&mut out, slot, false);
+                            let _ = write_reply(class, &out[..n]).await;
+                        }
+                    } else {
+                        let _ = write_reply(class, b"ERR RADIO\r\n").await;
+                    }
+                } else {
+                    let mut out = [0u8; 48];
+                    let n = format_switched_empty(&mut out, slot);
+                    let _ = write_reply(class, &out[..n]).await;
+                }
+            }
+            _ => {
+                let _ = write_reply(class, b"ERR SLOT\r\n").await;
+            }
+        }
         return;
     }
 
@@ -585,7 +684,7 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
         }
         let ok = send_key_report(&mut state.device, &keys, modifier);
         if state.paired {
-            storage::save(flash, &state.current_profile());
+            storage::save(flash, state.active_slot, &state.current_profile());
         }
         let _ = write_reply(class, if ok { b"OK\r\n" } else { b"ERR SEND\r\n" }).await;
         return;
@@ -618,14 +717,14 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
         // The AES counter advanced with each keystroke. Persist it so a reset
         // resumes from a fresh value the receiver hasn't seen (replay defense).
         if state.paired {
-            storage::save(flash, &state.current_profile());
+            storage::save(flash, state.active_slot, &state.current_profile());
         }
         return;
     }
 
     let _ = write_reply(
         class,
-        b"UCMDS: VER UPAIR UCONNECT UTYPE <text> UKEY <mod> [keys] UKEEPALIVE USTATUS UDELETE\r\n",
+        b"UCMDS: VER UPAIR [slot] UCONNECT UTYPE <text> UKEY <mod> [keys] USWITCH <slot> UKEEPALIVE USTATUS UDELETE [slot]\r\n",
     )
     .await;
 }
@@ -791,7 +890,13 @@ fn format_radiotest(out: &mut [u8], encoding: u8, acks: u32) -> usize {
 
 fn format_status(out: &mut [u8], state: &UnifyingState) -> usize {
     let mut pos = 0;
-    for &b in b"STATUS PAIRED=" {        out[pos] = b;
+    for &b in b"STATUS SLOT=" {
+        out[pos] = b;
+        pos += 1;
+    }
+    pos = write_u32(out, pos, state.active_slot as u32);
+    for &b in b" PAIRED=" {
+        out[pos] = b;
         pos += 1;
     }
     out[pos] = if state.paired { b'1' } else { b'0' };
@@ -812,6 +917,45 @@ fn format_status(out: &mut [u8], state: &UnifyingState) -> usize {
         pos += 1;
     }
     pos = write_u32(out, pos, state.device.aes_counter);
+    out[pos] = b'\r';
+    out[pos + 1] = b'\n';
+    pos + 2
+}
+
+fn format_switched(out: &mut [u8], slot: u8, connected: bool) -> usize {
+    let mut pos = 0;
+    for &b in b"SWITCHED " {
+        out[pos] = b;
+        pos += 1;
+    }
+    pos = write_u32(out, pos, slot as u32);
+    if connected {
+        for &b in b" CONNECTED" {
+            out[pos] = b;
+            pos += 1;
+        }
+    } else {
+        for &b in b" NOCONN" {
+            out[pos] = b;
+            pos += 1;
+        }
+    }
+    out[pos] = b'\r';
+    out[pos + 1] = b'\n';
+    pos + 2
+}
+
+fn format_switched_empty(out: &mut [u8], slot: u8) -> usize {
+    let mut pos = 0;
+    for &b in b"SWITCHED " {
+        out[pos] = b;
+        pos += 1;
+    }
+    pos = write_u32(out, pos, slot as u32);
+    for &b in b" EMPTY" {
+        out[pos] = b;
+        pos += 1;
+    }
     out[pos] = b'\r';
     out[pos + 1] = b'\n';
     pos + 2
