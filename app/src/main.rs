@@ -708,8 +708,9 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
                     ok_count += 1;
                 }
             }
-            // Yield so the USB task can service the host between characters.
-            Timer::after(Duration::from_millis(1)).await;
+            // Inter-key delay: receiver/OS HID stack needs time to process
+            // each press+release pair. 15ms matches the proven Pi CLI timing.
+            Timer::after(Duration::from_millis(15)).await;
         }
         let mut out = [0u8; 48];
         let n = format_typed(&mut out, ok_count, total);
@@ -741,6 +742,9 @@ fn type_char(device: &mut Device, c: u8) -> bool {
     keys[0] = scancode;
 
     let pressed = press_key(device, &keys, modifiers);
+    // Hold the key for ~10ms before releasing. The receiver/OS needs time to
+    // register the press before seeing the release. 64MHz * 10ms = 640k cycles.
+    cortex_m::asm::delay(640_000);
     release_keys(device);
     pressed
 }
@@ -754,6 +758,7 @@ fn type_char(device: &mut Device, c: u8) -> bool {
 /// loop, so a single send attempt is normally enough.
 fn send_key_report(device: &mut Device, keys: &[u8; KEYS_LEN], modifier: u8) -> bool {
     let pressed = press_key(device, keys, modifier);
+    cortex_m::asm::delay(640_000); // ~10ms hold before release
     release_keys(device);
     pressed
 }
