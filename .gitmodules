@@ -1,0 +1,3 @@
+[submodule "rust-unifying"]
+	path = rust-unifying
+	url = git@github.com:ZHLHZHU/rust-unifying.git

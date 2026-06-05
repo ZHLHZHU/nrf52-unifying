@@ -17,7 +17,7 @@ embassy-sync = "0.8.0"
 embassy-time = "0.5.1"
 embassy-usb = "0.6.0"
 panic-reset = "0.1.1"
-rust-unifying = { path = "../../rust-unifying/rust-unifying", default-features = false }
+rust-unifying = { path = "../rust-unifying/rust-unifying", default-features = false }
 aes = { version = "0.8", default-features = false }
 ctr = { version = "0.9", default-features = false }
 heapless = { version = "0.8", default-features = false }
