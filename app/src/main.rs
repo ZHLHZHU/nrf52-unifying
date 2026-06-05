@@ -138,6 +138,15 @@ async fn main(_spawner: Spawner) {
     pac::CLOCK.tasks_hfclkstart().write_value(1);
     while pac::CLOCK.events_hfclkstarted().read() != 1 {}
 
+    // Enable Power Failure Warning at 2.7V. When USB is unplugged, VDD drops
+    // from 3.3V; this gives us a few hundred μs to emergency-save the counter
+    // before the regulator loses hold.
+    pac::POWER.pofcon().write(|w| {
+        w.set_pof(true);
+        w.set_threshold(pac::power::vals::Threshold::V27);
+    });
+    pac::POWER.events_pofwarn().write_value(0);
+
     let flash = Mutex::<NoopRawMutex, _>::new(RefCell::new(Nvmc::new(p.NVMC)));
 
     let driver = Driver::new(p.USBD, Irqs, HardwareVbusDetect::new(Irqs));
@@ -178,12 +187,21 @@ async fn main(_spawner: Spawner) {
     // Restore persisted active slot and its profile from flash.
     if let Some(slot) = storage::load_active_slot(&flash) {
         unifying.active_slot = slot;
-        if let Some(profile) = storage::load(&flash, slot) {
+        if let Some(mut profile) = storage::load(&flash, slot) {
+            // Safety margin: jump counter forward to cover any un-persisted
+            // keystrokes from before a crash/power-loss. The receiver accepts
+            // any counter strictly greater than its last-seen value (no upper
+            // window), so skipping 512 is harmless but guarantees we won't
+            // replay values it already saw.
+            profile.aes_counter = profile.aes_counter.wrapping_add(512);
             unifying.apply_profile(&profile);
+            storage::save(&flash, slot, &profile);
         }
-    } else if let Some(profile) = storage::load(&flash, 0) {
+    } else if let Some(mut profile) = storage::load(&flash, 0) {
         // Backward compat: no active-slot stored, try slot 0.
+        profile.aes_counter = profile.aes_counter.wrapping_add(512);
         unifying.apply_profile(&profile);
+        storage::save(&flash, 0, &profile);
     }
 
     let usb_fut = usb.run();
@@ -222,6 +240,17 @@ async fn main(_spawner: Spawner) {
                         Either::First(Err(_)) => break,
                         Either::Second(_) => {
                             let _ = unifying.device.tick();
+                            // Check for power failure warning — emergency save.
+                            if pac::POWER.events_pofwarn().read() != 0 {
+                                pac::POWER.events_pofwarn().write_value(0);
+                                if unifying.paired {
+                                    storage::save(
+                                        &flash,
+                                        unifying.active_slot,
+                                        &unifying.current_profile(),
+                                    );
+                                }
+                            }
                             continue;
                         }
                     }
@@ -684,6 +713,58 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
         }
         let ok = send_key_report(&mut state.device, &keys, modifier);
         if state.paired {
+            storage::save(flash, state.active_slot, &state.current_profile());
+        }
+        let _ = write_reply(class, if ok { b"OK\r\n" } else { b"ERR SEND\r\n" }).await;
+        return;
+    }
+
+    // UKEYDOWN <mod-hex> [keycode-hex ...up to 6]
+    // Like UKEY but sends ONLY the press report (no auto-release). Used by the
+    // KVM forwarder which sends state-based reports: each UKEYDOWN is the full
+    // set of currently-held keys, and a final `UKEYDOWN 00` acts as all-up.
+    if let Some(rest) = line.strip_prefix(b"UKEYDOWN ") {
+        if !state.connected {
+            let _ = write_reply(class, b"ERR NOTCONN\r\n").await;
+            return;
+        }
+        let mut tokens = rest.split(|&b| b == b' ').filter(|t| !t.is_empty());
+        let modifier = match tokens.next().and_then(parse_u8_hex) {
+            Some(m) => m,
+            None => {
+                let _ = write_reply(class, b"ERR ARG\r\n").await;
+                return;
+            }
+        };
+        let mut keys = [0u8; KEYS_LEN];
+        let mut count = 0usize;
+        let mut bad = false;
+        for tok in tokens {
+            if count >= KEYS_LEN {
+                bad = true;
+                break;
+            }
+            match parse_u8_hex(tok) {
+                Some(k) => {
+                    keys[count] = k;
+                    count += 1;
+                }
+                None => {
+                    bad = true;
+                    break;
+                }
+            }
+        }
+        if bad {
+            let _ = write_reply(class, b"ERR ARG\r\n").await;
+            return;
+        }
+        // Send only the press — no release. The KVM sends the next state
+        // (or UKEYDOWN 00) when keys change.
+        let ok = press_key(&mut state.device, &keys, modifier);
+        // Periodic save: every 128 keystrokes persist the counter to limit
+        // the gap on unexpected power loss (startup +512 covers the rest).
+        if state.paired && state.device.aes_counter & 0x7F == 0 {
             storage::save(flash, state.active_slot, &state.current_profile());
         }
         let _ = write_reply(class, if ok { b"OK\r\n" } else { b"ERR SEND\r\n" }).await;
