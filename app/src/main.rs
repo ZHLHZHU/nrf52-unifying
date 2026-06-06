@@ -647,29 +647,20 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
             Some(slot) if slot < MAX_PROFILES => {
                 let has_profile = state.switch_to(flash, slot);
                 if has_profile {
-                    // Auto-reconnect on the new profile.
+                    // Don't block on connect(): just configure the radio and
+                    // set connected=true. The background keep-alive tick (every
+                    // 8ms) will find the right channel within ~200ms via the
+                    // protocol's built-in channel hopping on transmit failure.
+                    // This keeps USWITCH instant for the KVM event loop.
                     if state.device.configure_radio().is_ok() {
-                        let mut ok = false;
-                        for _ in 0..30 {
-                            if state.device.connect().is_ok() {
-                                ok = true;
-                                break;
-                            }
-                            Timer::after(Duration::from_millis(20)).await;
-                        }
-                        if ok {
-                            state.connected = true;
-                            let mut out = [0u8; 48];
-                            let n = format_switched(&mut out, slot, true);
-                            let _ = write_reply(class, &out[..n]).await;
-                        } else {
-                            let mut out = [0u8; 48];
-                            let n = format_switched(&mut out, slot, false);
-                            let _ = write_reply(class, &out[..n]).await;
-                        }
+                        state.connected = true;
                     } else {
                         let _ = write_reply(class, b"ERR RADIO\r\n").await;
+                        return;
                     }
+                    let mut out = [0u8; 48];
+                    let n = format_switched(&mut out, slot, true);
+                    let _ = write_reply(class, &out[..n]).await;
                 } else {
                     let mut out = [0u8; 48];
                     let n = format_switched_empty(&mut out, slot);
