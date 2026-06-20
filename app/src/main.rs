@@ -20,7 +20,7 @@ use embassy_nrf::usb::Driver;
 use embassy_nrf::{bind_interrupts, pac, peripherals, usb};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::{Builder, Config};
@@ -61,6 +61,8 @@ struct UnifyingState {
     connected: bool,
     /// Currently active profile slot (0..MAX_PROFILES).
     active_slot: u8,
+    /// Last keystroke activity timestamp — used for idle timeout backoff.
+    last_activity: Instant,
 }
 
 impl UnifyingState {
@@ -81,6 +83,7 @@ impl UnifyingState {
             paired: false,
             connected: false,
             active_slot: 0,
+            last_activity: Instant::now(),
         }
     }
 
@@ -236,6 +239,18 @@ async fn main(_spawner: Spawner) {
                         Either::First(Ok(n)) => n,
                         Either::First(Err(_)) => break,
                         Either::Second(_) => {
+                            // Idle backoff: increase the keep-alive timeout when
+                            // no keystrokes are active. This tells the receiver
+                            // to poll us less frequently, freeing time slots for
+                            // other devices (e.g. the mouse).
+                            let idle_ms = Instant::now()
+                                .duration_since(unifying.last_activity)
+                                .as_millis();
+                            unifying.device.timeout = if idle_ms > 500 {
+                                110
+                            } else {
+                                20
+                            };
                             let _ = unifying.device.tick();
                             // Check for power failure warning — emergency save.
                             if pac::POWER.events_pofwarn().read() != 0 {
@@ -683,6 +698,8 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
             let _ = write_reply(class, b"ERR NOTCONN\r\n").await;
             return;
         }
+        state.last_activity = Instant::now();
+        state.device.timeout = 20;
         let mut tokens = rest.split(|&b| b == b' ').filter(|t| !t.is_empty());
         let modifier = match tokens.next().and_then(parse_u8_hex) {
             Some(m) => m,
@@ -734,6 +751,8 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
             let _ = write_reply(class, b"ERR NOTCONN\r\n").await;
             return;
         }
+        state.last_activity = Instant::now();
+        state.device.timeout = 20;
         let mut tokens = rest.split(|&b| b == b' ').filter(|t| !t.is_empty());
         let modifier = match tokens.next().and_then(parse_u8_hex) {
             Some(m) => m,
@@ -782,6 +801,8 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
             let _ = write_reply(class, b"ERR NOTCONN\r\n").await;
             return;
         }
+        state.last_activity = Instant::now();
+        state.device.timeout = 20;
         // Stabilize the link with a few keep-alives first.
         for _ in 0..5 {
             let _ = state.device.tick();
