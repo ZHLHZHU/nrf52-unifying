@@ -5,6 +5,10 @@ edition = "2021"
 publish = false
 build = "build.rs"
 
+[features]
+default = []
+uart-smoke = []
+
 [dependencies]
 cortex-m = { version = "0.7.7", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7.5"

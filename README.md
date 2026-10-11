@@ -1,8 +1,14 @@
 # nRF52840 优联键盘发射器
 
+> 当前自制 KVM 板：RX=P0.06 / 006、TX=P0.08 / 008；P0.02 未连接。板 USB-C 供电，DAPLink 当前接 RP，nRF 经板内 UART 更新。实板接线与 SWD 操作见 [BOARD-KVM.md](docs/BOARD-KVM.md)；下文原开发板 USB/引脚记录仅适用于历史配置。
+
+
 用 nRF52840 的**片上原生 2.4GHz 射频**(ESB 模式)模拟一个 Logitech Unifying 无线键盘,通过 USB-CDC 串口接收上位机命令向接收器发送按键,无需外接 nRF24L01 模块。
 
 基于 [`rust-unifying`](../rust-unifying) 协议库与 embassy + embassy-boot 脚手架实现,保留 CDC OTA 升级能力(首刷之后纯靠 USB 线升级,不依赖 SWD)。
+
+
+UART 更新的构建、上传和排错命令见 [UART-OTA.md](docs/UART-OTA.md)。DAPLink 留在 RP 上即可。
 
 ## 特性
 

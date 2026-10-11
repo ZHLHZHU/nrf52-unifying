@@ -15,6 +15,5 @@ fn main() {
         .to_string();
 
     println!("cargo:rustc-link-search={}", out_dir.display());
-    println!("cargo:rerun-if-changed=memory.x");
     println!("cargo:rustc-env=BUILD_TIME={build_time}");
 }

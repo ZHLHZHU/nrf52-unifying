@@ -1,12 +1,47 @@
 #![no_std]
 #![no_main]
 
+
+// SWD snapshots only: no diagnostic text is injected into the protocol.
+#[repr(C)]
+pub struct UartDebug {
+    rx_bytes: u32, rx_chunks: u32, rx_frames: u32, rx_errors: u32,
+    tx_bytes: u32, tx_frames: u32, tx_errors: u32,
+    rx_len: u32, tx_len: u32, rx: [u8; 256], tx: [u8; 256],
+}
+#[no_mangle]
+pub static mut nrf_uart_debug: UartDebug = UartDebug {
+    rx_bytes: 0, rx_chunks: 0, rx_frames: 0, rx_errors: 0,
+    tx_bytes: 0, tx_frames: 0, tx_errors: 0,
+    rx_len: 0, tx_len: 0, rx: [0; 256], tx: [0; 256],
+};
+fn debug_add(p: *mut u32, n: u32) {
+    unsafe { p.write_volatile(p.read_volatile().wrapping_add(n)); }
+}
+fn debug_packet(tx: bool, bytes: &[u8]) {
+    unsafe {
+        let d = core::ptr::addr_of_mut!(nrf_uart_debug);
+        let (buf, len) = if tx {
+            (core::ptr::addr_of_mut!((*d).tx).cast::<u8>(), core::ptr::addr_of_mut!((*d).tx_len))
+        } else {
+            (core::ptr::addr_of_mut!((*d).rx).cast::<u8>(), core::ptr::addr_of_mut!((*d).rx_len))
+        };
+        len.write_volatile(0);
+        for (i, &b) in bytes.iter().take(256).enumerate() { buf.add(i).write_volatile(b); }
+        len.write_volatile(bytes.len().min(256) as u32);
+    }
+}
+
 mod esb_radio;
 mod keymap;
 mod storage;
 mod unifying_hal;
+mod uart_link;
+mod uart_ota;
+#[cfg(feature = "uart-smoke")]
+mod uart_smoke;
 
-use core::{cell::RefCell, str};
+use core::{cell::RefCell, str, sync::atomic::{AtomicBool, AtomicU32, Ordering}};
 
 use cortex_m::peripheral::SCB;
 use embassy_boot::State as BootState;
@@ -17,11 +52,12 @@ use embassy_futures::select::{select, Either};
 use embassy_nrf::nvmc::Nvmc;
 use embassy_nrf::usb::vbus_detect::{HardwareVbusDetect, VbusDetect};
 use embassy_nrf::usb::Driver;
-use embassy_nrf::{bind_interrupts, pac, peripherals, usb};
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_nrf::{bind_interrupts, pac, peripherals, usb, uarte};
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::blocking_mutex::Mutex;
+use embassy_sync::{channel::Channel, signal::Signal};
 use embassy_time::{Duration, Instant, Timer};
-use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
+use embassy_usb::class::cdc_acm::{CdcAcmClass, State, Sender};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::{Builder, Config};
 use panic_reset as _;
@@ -40,9 +76,17 @@ use unifying_hal::{EmbassyClock, SwAesCtr};
 bind_interrupts!(struct Irqs {
     USBD => usb::InterruptHandler<peripherals::USBD>;
     CLOCK_POWER => usb::vbus_detect::InterruptHandler;
+    UARTE0 => uarte::InterruptHandler<peripherals::UARTE0>;
 });
 
 const ACTIVE_IMAGE_LIMIT: usize = 480 * 1024;
+#[cfg(not(feature = "uart-smoke"))]
+const VERSION_REPLY: &[u8] =
+    concat!("VER unifying/1 build=", env!("BUILD_TIME"), "\r\n").as_bytes();
+#[cfg(feature = "uart-smoke")]
+const VERSION_REPLY: &[u8] =
+    concat!("VER unifying/1 build=", env!("BUILD_TIME"), " uart-smoke\r\n").as_bytes();
+
 const READY_BANNER: &[u8] =
     concat!("nrf-unifying ready build=", env!("BUILD_TIME"), "\r\n").as_bytes();
 const INFO_BOOT: &[u8] = concat!("STATE BOOT BUILD=", env!("BUILD_TIME"), "\r\n").as_bytes();
@@ -54,7 +98,7 @@ const INFO_ERR: &[u8] = concat!("STATE ERR BUILD=", env!("BUILD_TIME"), "\r\n").
 /// Concrete `UnifyingDevice` for this board.
 type Device = UnifyingDevice<EsbRadio, EmbassyClock, SwAesCtr>;
 
-/// Persistent Unifying connection state held across CDC commands.
+/// Persistent connection state owned exclusively by the radio worker.
 struct UnifyingState {
     device: Device,
     paired: bool,
@@ -110,6 +154,13 @@ impl UnifyingState {
     /// Switch to a different profile slot and load it from flash.
     /// Returns true if the slot has a stored pairing.
     fn switch_to(&mut self, flash: &SharedFlash<'_>, slot: u8) -> bool {
+        if slot == self.active_slot {
+            // Never overwrite the live counter with an older flash snapshot.
+            return self.paired;
+        }
+        if self.paired {
+            storage::save(flash, self.active_slot, &self.current_profile());
+        }
         self.connected = false;
         self.active_slot = slot;
         storage::save_active_slot(flash, slot);
@@ -134,6 +185,157 @@ impl From<EndpointError> for Disconnected {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Source {
+    Cdc(u32),
+    Uart { number: u32, session: u32, fault_generation: u32 },
+}
+
+struct Request {
+    source: Source,
+    line: [u8; 256],
+    len: usize,
+    error: Option<uart_link::CommandError>,
+}
+
+struct Reply {
+    source: Source,
+    bytes: [u8; 512],
+    len: usize,
+}
+
+// Radio ownership never awaits either transport's output endpoint.
+static REQUESTS: Channel<CriticalSectionRawMutex, Request, 8> = Channel::new();
+static CDC_REPLIES: Channel<CriticalSectionRawMutex, Reply, 1> = Channel::new();
+static UART_REPLIES: Channel<CriticalSectionRawMutex, Reply, 1> = Channel::new();
+static MAINTENANCE_CHANGED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+static MAINTENANCE_READY: Signal<CriticalSectionRawMutex, u32> = Signal::new();
+#[cfg(not(feature = "uart-smoke"))]
+static UART_SESSION_CHANGED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+#[cfg(not(feature = "uart-smoke"))]
+static UART_SYNC_REQUIRED: AtomicBool = AtomicBool::new(true);
+static CDC_ACTIVE: AtomicBool = AtomicBool::new(false);
+static CDC_SESSION: AtomicU32 = AtomicU32::new(0);
+static UART_OTA_ACTIVE: AtomicBool = AtomicBool::new(false);
+static UPLOAD_ACTIVE: AtomicBool = AtomicBool::new(false);
+static UART_DAMAGED: AtomicBool = AtomicBool::new(false);
+static UART_GENERATION: AtomicU32 = AtomicU32::new(0);
+static USB_AVAILABLE: AtomicBool = AtomicBool::new(false);
+static USB_DTR_VALID: AtomicBool = AtomicBool::new(false);
+static USB_LIFECYCLE_CHANGED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+// Once accepted, BOOT/REBOOT must survive cancellation of the CDC session.
+static REBOOT_REQUESTED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+
+struct UartDfuStore<'a, 'b, D: embedded_storage::nor_flash::NorFlash, S: embedded_storage::nor_flash::NorFlash> {
+    updater: &'a mut BlockingFirmwareUpdater<'b, D, S>,
+}
+impl<D: embedded_storage::nor_flash::NorFlash, S: embedded_storage::nor_flash::NorFlash> uart_ota::Storage for UartDfuStore<'_, '_, D, S> {
+    fn write(&mut self, offset: usize, bytes: &[u8]) -> bool { self.updater.write_firmware(offset, bytes).is_ok() }
+    fn read(&mut self, offset: usize, bytes: &mut [u8]) -> bool {
+        if offset.checked_add(bytes.len()).is_none_or(|end| end > uart_ota::LIMIT) { return false; }
+        self.updater.read_dfu(offset as u32, bytes).is_ok()
+    }
+    fn commit(&mut self) -> bool { self.updater.mark_updated().is_ok() }
+}
+
+struct UsbLifecycle;
+
+impl UsbLifecycle {
+    fn unavailable(&mut self) {
+        USB_AVAILABLE.store(false, Ordering::Relaxed);
+        USB_DTR_VALID.store(false, Ordering::Relaxed);
+        // CDC Control does not clear DTR on PowerRemoved in embassy-usb 0.6.
+        // Cancel this generation synchronously even when the nRF stays powered.
+        CDC_ACTIVE.store(false, Ordering::Relaxed);
+        CDC_SESSION.fetch_add(1, Ordering::Relaxed);
+        UPLOAD_ACTIVE.store(false, Ordering::Relaxed);
+        while CDC_REPLIES.try_receive().is_ok() {}
+        MAINTENANCE_CHANGED.signal(());
+        #[cfg(not(feature = "uart-smoke"))]
+        UART_SESSION_CHANGED.signal(());
+        USB_LIFECYCLE_CHANGED.signal(());
+    }
+}
+
+impl embassy_usb::Handler for UsbLifecycle {
+    fn enabled(&mut self, enabled: bool) {
+        if !enabled { self.unavailable(); }
+    }
+
+    fn reset(&mut self) {
+        self.unavailable();
+    }
+
+    fn configured(&mut self, configured: bool) {
+        if configured {
+            USB_AVAILABLE.store(true, Ordering::Relaxed);
+            USB_LIFECYCLE_CHANGED.signal(());
+        } else {
+            self.unavailable();
+        }
+    }
+
+    fn control_out(
+        &mut self, req: embassy_usb::control::Request, _data: &[u8],
+    ) -> Option<embassy_usb::control::OutResponse> {
+        use embassy_usb::control::{Recipient, RequestType};
+        // This application has one CDC function, with communication interface 0.
+        // Observe fresh SET_CONTROL_LINE_STATE before CDC handles it; never
+        // reactivate maintenance from the stale DTR retained after unplugging.
+        if req.request_type == RequestType::Class
+            && req.recipient == Recipient::Interface && req.index == 0
+            && req.request == 0x22
+        {
+            USB_DTR_VALID.store(req.value & 1 != 0, Ordering::Relaxed);
+            USB_LIFECYCLE_CHANGED.signal(());
+        }
+        None // CDC remains the sole owner of the actual control response.
+    }
+}
+
+struct ReplySink {
+    reply: Reply,
+}
+
+impl ReplySink {
+    fn new(source: Source) -> Self {
+        Self { reply: Reply { source, bytes: [0; 512], len: 0 } }
+    }
+
+    async fn write(&mut self, data: &[u8]) -> Result<(), ()> {
+        let end = self.reply.len + data.len();
+        if end > self.reply.bytes.len() { return Err(()); }
+        self.reply.bytes[self.reply.len..end].copy_from_slice(data);
+        self.reply.len = end;
+        Ok(())
+    }
+}
+
+async fn session_ended(session: u32) {
+    while CDC_ACTIVE.load(Ordering::Relaxed)
+        && CDC_SESSION.load(Ordering::Relaxed) == session
+    {
+        Timer::after(Duration::from_millis(1)).await;
+    }
+}
+
+#[cfg(not(feature = "uart-smoke"))]
+fn poll_radio(state: &mut UnifyingState, flash: &SharedFlash<'_>) {
+    if state.connected && !UPLOAD_ACTIVE.load(Ordering::Relaxed) && !UART_OTA_ACTIVE.load(Ordering::Relaxed) {
+        let idle_ms = Instant::now().duration_since(state.last_activity).as_millis();
+        state.device.timeout = if idle_ms > 500 { 110 } else { 20 };
+        let _ = state.device.tick();
+    }
+    // A polled warning, not a measured power-loss guarantee.
+    if pac::POWER.events_pofwarn().read() != 0 {
+        pac::POWER.events_pofwarn().write_value(0);
+        if state.paired {
+            storage::save(flash, state.active_slot, &state.current_profile());
+        }
+    }
+}
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = embassy_nrf::init(Default::default());
@@ -141,9 +343,8 @@ async fn main(_spawner: Spawner) {
     pac::CLOCK.tasks_hfclkstart().write_value(1);
     while pac::CLOCK.events_hfclkstarted().read() != 1 {}
 
-    // Enable Power Failure Warning at 2.7V. When USB is unplugged, VDD drops
-    // from 3.3V; this gives us a few hundred μs to emergency-save the counter
-    // before the regulator loses hold.
+    // Preserve the existing polled 2.7V power warning and persistence behavior.
+    // Available hold-up time is unmeasured; this is not a power-loss guarantee.
     pac::POWER.pofcon().write(|w| {
         w.set_pof(true);
         w.set_threshold(pac::power::vals::Threshold::V27);
@@ -166,6 +367,7 @@ async fn main(_spawner: Spawner) {
     let mut msos_descriptor = [0; 256];
     let mut control_buf = [0; 64];
     let mut cdc_state = State::new();
+    let mut usb_lifecycle = UsbLifecycle;
 
     let mut builder = Builder::new(
         driver,
@@ -175,7 +377,9 @@ async fn main(_spawner: Spawner) {
         &mut msos_descriptor,
         &mut control_buf,
     );
-    let mut class = CdcAcmClass::new(&mut builder, &mut cdc_state, 64);
+    // Register first so lifecycle observes CDC control requests without consuming them.
+    builder.handler(&mut usb_lifecycle);
+    let class = CdcAcmClass::new(&mut builder, &mut cdc_state, 64);
     let mut usb = builder.build();
 
     let updater_config = FirmwareUpdaterConfig::from_linkerfile_blocking(&flash, &flash);
@@ -187,6 +391,8 @@ async fn main(_spawner: Spawner) {
     }
 
     let mut unifying = UnifyingState::new();
+    #[cfg(not(feature = "uart-smoke"))]
+    {
     // Restore persisted active slot and its profile from flash.
     if let Some(slot) = storage::load_active_slot(&flash) {
         unifying.active_slot = slot;
@@ -203,6 +409,336 @@ async fn main(_spawner: Spawner) {
         unifying.apply_profile(&profile);
         storage::save(&flash, 0, &profile);
     }
+    }
+
+    // User-confirmed nice!nano-compatible mapping, derived from the v2 schematic:
+    // P0.02 (002/D19) RX and P0.06 (006/D1) TX are the lowest free exposed GPIOs.
+    // https://nicekeyboards.com/docs/nice-nano/pinout-schematic/
+    let mut uart_config = uarte::Config::default();
+    uart_config.baudrate = uarte::Baudrate::BAUD1M;
+    uart_config.parity = uarte::Parity::EXCLUDED;
+    let uart = uarte::Uarte::new(p.UARTE0, p.P0_06, p.P0_08, Irqs, uart_config);
+    // Keep RX idle high while the Pico resets or its TX is disconnected.
+    pac::P0.pin_cnf(6).modify(|w| w.set_pull(pac::gpio::vals::Pull::PULLUP));
+    let (mut uart_tx, mut uart_rx) =
+        uart.split_with_idle(p.TIMER0, p.PPI_CH0, p.PPI_CH1);
+    let (mut cdc_tx, mut cdc_rx, cdc_control) = class.split_with_control();
+
+    let control_fut = async {
+        // USB configuration plus a fresh DTR assertion are both required.
+        loop {
+            let next = USB_AVAILABLE.load(Ordering::Relaxed)
+                && USB_DTR_VALID.load(Ordering::Relaxed) && cdc_control.dtr();
+            if next != CDC_ACTIVE.load(Ordering::Relaxed) {
+                CDC_SESSION.fetch_add(1, Ordering::Relaxed);
+                CDC_ACTIVE.store(next, Ordering::Relaxed);
+                #[cfg(not(feature = "uart-smoke"))]
+                if next {
+                    // Even a whole CDC window between UART requests must be noticed.
+                    UART_SYNC_REQUIRED.store(true, Ordering::Relaxed);
+                }
+                if !next {
+                    UPLOAD_ACTIVE.store(false, Ordering::Relaxed);
+                    while CDC_REPLIES.try_receive().is_ok() {}
+                }
+                MAINTENANCE_CHANGED.signal(());
+                #[cfg(not(feature = "uart-smoke"))]
+                UART_SESSION_CHANGED.signal(());
+            }
+            let _ = select(
+                cdc_control.control_changed(), USB_LIFECYCLE_CHANGED.wait(),
+            ).await;
+        }
+    };
+    #[cfg(not(feature = "uart-smoke"))]
+    let worker_fut = async {
+        let mut ota = uart_ota::Ota::default();
+        let config = FirmwareUpdaterConfig::from_linkerfile_blocking(&flash, &flash);
+        let mut ota_aligned = [0u8; 4];
+        let mut ota_updater = BlockingFirmwareUpdater::new(config, &mut ota_aligned);
+        let mut ota_deadline = Instant::now();
+        let interval = Duration::from_millis(8);
+        let mut deadline = Instant::now() + interval;
+        let mut session_seen = 0;
+        loop {
+            if ota.active && Instant::now() >= ota_deadline {
+                ota.abort(); UART_OTA_ACTIVE.store(false, Ordering::Relaxed);
+                UART_SYNC_REQUIRED.store(true, Ordering::Relaxed);
+            }
+            let session = CDC_SESSION.load(Ordering::Relaxed);
+            if session != session_seen {
+                session_seen = session;
+                if CDC_ACTIVE.load(Ordering::Relaxed) {
+                    // Complete the current command, then all-up before CDC owns the radio.
+                    if unifying.connected {
+                        let _ = press_key(&mut unifying.device, &[0; KEYS_LEN], 0);
+                    }
+                    MAINTENANCE_READY.signal(session);
+                }
+            }
+            if UART_DAMAGED.swap(false, Ordering::Relaxed) && unifying.connected {
+                let _ = press_key(&mut unifying.device, &[0; KEYS_LEN], 0);
+            }
+            if Instant::now() >= deadline {
+                poll_radio(&mut unifying, &flash);
+                while deadline <= Instant::now() { deadline += interval; }
+            }
+            let request = match select(
+                REQUESTS.receive(),
+                select(Timer::at(deadline), MAINTENANCE_CHANGED.wait()),
+            ).await {
+                Either::First(request) => request,
+                Either::Second(_) => continue,
+            };
+            // Absolute deadline also checked before every command under sustained load.
+            if Instant::now() >= deadline {
+                poll_radio(&mut unifying, &flash);
+                while deadline <= Instant::now() { deadline += interval; }
+            }
+            let mut sink = ReplySink::new(request.source);
+            match request.source {
+                Source::Cdc(epoch) => {
+                    if !CDC_ACTIVE.load(Ordering::Relaxed)
+                        || CDC_SESSION.load(Ordering::Relaxed) != epoch
+                        || session_seen != epoch
+                    { continue; }
+                }
+                Source::Uart { session, fault_generation, .. } => {
+                    if fault_generation != UART_GENERATION.load(Ordering::Relaxed) {
+                        continue; // Never execute an input queued before UART damage.
+                    }
+                    if CDC_ACTIVE.load(Ordering::Relaxed)
+                        || session != CDC_SESSION.load(Ordering::Relaxed)
+                    {
+                        let _ = sink.write(b"ERR BUSY\r\n").await;
+                    }
+                    else if UART_SYNC_REQUIRED.load(Ordering::Relaxed) {
+                        if request.error.is_none() && &request.line[..request.len] == b"VER" {
+                            UART_SYNC_REQUIRED.store(false, Ordering::Relaxed);
+                        } else {
+                            let _ = sink.write(b"ERR BUSY\r\n").await;
+                        }
+                    }
+                }
+            }
+            if sink.reply.len == 0 && matches!(request.source, Source::Uart { .. }) && request.line[..request.len].starts_with(b"OTA ") {
+                if UPLOAD_ACTIVE.load(Ordering::Relaxed) {
+                    let _ = sink.write(b"ERR BUSY\r\n").await;
+                } else {
+                    if request.line[..request.len].starts_with(b"OTA BEGIN ") && unifying.connected {
+                        let _ = press_key(&mut unifying.device, &[0; KEYS_LEN], 0);
+                    }
+                    if request.line[..request.len].starts_with(b"OTA BEGIN ") {
+                        drop(ota_updater);
+                        let config = FirmwareUpdaterConfig::from_linkerfile_blocking(&flash, &flash);
+                        ota_updater = BlockingFirmwareUpdater::new(config, &mut ota_aligned);
+                    }
+                    let mut store = UartDfuStore { updater: &mut ota_updater };
+                    let (reply, reboot) = if &request.line[..request.len] == b"OTA INFO" {
+                        (if matches!(store.updater.get_state(), Ok(BootState::Boot)) { b"OTA BOOT\r\n" as &[u8] } else { b"OTA PENDING\r\n" }, false)
+                    } else { ota.handle(&request.line[..request.len], &mut store) };
+                    UART_OTA_ACTIVE.store(ota.active, Ordering::Relaxed);
+                    ota_deadline = Instant::now() + Duration::from_secs(60);
+                    let _ = sink.write(reply).await;
+                    if reboot { REBOOT_REQUESTED.signal(()); }
+                }
+            }
+            if sink.reply.len == 0 && ota.active {
+                let _ = sink.write(b"ERR BUSY\r\n").await;
+            }
+            if sink.reply.len == 0 {
+                match request.error {
+                    Some(uart_link::CommandError::Command) => {
+                        let _ = sink.write(b"ERR CMD\r\n").await;
+                    }
+                    Some(uart_link::CommandError::Argument) => {
+                        let _ = sink.write(b"ERR ARG\r\n").await;
+                    }
+                    None => handle_unifying_command(
+                        &mut sink, &mut unifying, &flash, &request.line[..request.len],
+                    ).await,
+                }
+            }
+            match request.source {
+                Source::Cdc(epoch) if CDC_ACTIVE.load(Ordering::Relaxed)
+                    && CDC_SESSION.load(Ordering::Relaxed) == epoch => {
+                    // CDC submits only one request at a time; stale replies never block.
+                    let _ = CDC_REPLIES.try_send(sink.reply);
+                }
+                Source::Uart { .. } => {
+                    if UART_REPLIES.try_send(sink.reply).is_err() {
+                        UART_GENERATION.fetch_add(1, Ordering::Relaxed);
+                        UART_DAMAGED.store(true, Ordering::Relaxed);
+                    }
+                }
+                _ => {}
+            }
+        }
+    };
+    #[cfg(feature = "uart-smoke")]
+    let worker_fut = async {
+        let mut session_seen = 0;
+        loop {
+            let session = CDC_SESSION.load(Ordering::Relaxed);
+            if session != session_seen {
+                session_seen = session;
+                if CDC_ACTIVE.load(Ordering::Relaxed) {
+                    // No radio ownership or all-up is required in diagnostic mode.
+                    MAINTENANCE_READY.signal(session);
+                }
+            }
+            let request = match select(REQUESTS.receive(), MAINTENANCE_CHANGED.wait()).await {
+                Either::First(request) => request,
+                Either::Second(_) => continue,
+            };
+            let Source::Cdc(epoch) = request.source else { continue; };
+            if !CDC_ACTIVE.load(Ordering::Relaxed)
+                || CDC_SESSION.load(Ordering::Relaxed) != epoch || session_seen != epoch
+            { continue; }
+            let mut sink = ReplySink::new(request.source);
+            handle_unifying_command(
+                &mut sink, &mut unifying, &flash, &request.line[..request.len],
+            ).await;
+            if CDC_ACTIVE.load(Ordering::Relaxed)
+                && CDC_SESSION.load(Ordering::Relaxed) == epoch
+            {
+                let _ = CDC_REPLIES.try_send(sink.reply);
+            }
+        }
+    };
+    #[cfg(feature = "uart-smoke")]
+    let uart_rx_fut = async {
+        let mut parser = uart_smoke::Parser::new();
+        let mut packet = [0u8; 256];
+        loop {
+            match uart_rx.read_until_idle(&mut packet).await {
+                Ok(n) => {
+                    uart_smoke::received_bytes(n);
+                    for &byte in &packet[..n] {
+                        match parser.push(byte) {
+                            Some(uart_smoke::Frame::Peer(sequence)) =>
+                                uart_smoke::received_peer(sequence),
+                            Some(uart_smoke::Frame::Bad) => uart_smoke::bad_frame(),
+                            None => {}
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Embassy returns no length on error; EasyDMA still reports received bytes.
+                    let n = pac::UARTE0.dma().rx().amount().read().0 as usize;
+                    uart_smoke::received_bytes(n);
+                    uart_smoke::uart_error();
+                    if parser.damaged() { uart_smoke::bad_frame(); }
+                }
+            }
+        }
+    };
+    #[cfg(feature = "uart-smoke")]
+    let uart_tx_fut = async {
+        let interval = Duration::from_secs(1);
+        let mut deadline = Instant::now() + interval;
+        let mut sequence = 1u32;
+        loop {
+            Timer::at(deadline).await;
+            let wire = uart_smoke::encode_ping(sequence);
+            match uart_tx.write(&wire).await {
+                Ok(()) => uart_smoke::transmitted_frame(),
+                Err(_) => uart_smoke::uart_error(),
+            }
+            sequence = sequence.wrapping_add(1);
+            // No CDC DTR, maintenance or upload state gates either diagnostic UART task.
+            while deadline <= Instant::now() { deadline += interval; }
+        }
+    };
+    #[cfg(not(feature = "uart-smoke"))]
+    let uart_rx_fut = async {
+        let mut parser = uart_link::Parser::new();
+        let mut packet = [0u8; 256];
+        let mut parser_session = CDC_SESSION.load(Ordering::Relaxed);
+        loop {
+            // Both session publishers run on this executor. Consume any old wake
+            // before taking the epoch for the new DMA read.
+            UART_SESSION_CHANGED.reset();
+            let read_session = CDC_SESSION.load(Ordering::Relaxed);
+            if read_session != parser_session {
+                parser.session_changed(&[]);
+                parser_session = read_session;
+            }
+            let result = select(
+                UART_SESSION_CHANGED.wait(), uart_rx.read_until_idle(&mut packet),
+            ).await;
+            let n = match result {
+                Either::First(_) => {
+                    // Dropping Embassy's read stops DMA and waits for ENDRX.
+                    let n = pac::UARTE0.dma().rx().amount().read().0 as usize;
+                    pac::UARTE0.events_dma().rx().ready().write_value(0);
+                    parser.session_changed(&packet[..n]);
+                    parser_session = CDC_SESSION.load(Ordering::Relaxed);
+                    continue;
+                }
+                Either::Second(Err(_)) => {
+                    unsafe { debug_add(core::ptr::addr_of_mut!(nrf_uart_debug.rx_errors), 1); }
+                    parser.damaged();
+                    UART_GENERATION.fetch_add(1, Ordering::Relaxed);
+                    UART_DAMAGED.store(true, Ordering::Relaxed);
+                    MAINTENANCE_CHANGED.signal(());
+                    continue;
+                }
+                Either::Second(Ok(n)) => n,
+            };
+            unsafe { debug_add(core::ptr::addr_of_mut!(nrf_uart_debug.rx_bytes), n as u32); }
+            unsafe { debug_add(core::ptr::addr_of_mut!(nrf_uart_debug.rx_chunks), 1); }
+            debug_packet(false, &packet[..n]);
+            let current_session = CDC_SESSION.load(Ordering::Relaxed);
+            if current_session != read_session {
+                parser.session_changed(&packet[..n]);
+                parser_session = current_session;
+                continue;
+            }
+            for &byte in &packet[..n] {
+                if let Some(frame) = parser.push(byte) {
+                    unsafe { debug_add(core::ptr::addr_of_mut!(nrf_uart_debug.rx_frames), 1); }
+                    let request = Request {
+                        source: Source::Uart {
+                            number: frame.number,
+                            session: read_session,
+                            fault_generation: UART_GENERATION.load(Ordering::Relaxed),
+                        }, line: frame.command,
+                        len: frame.len, error: frame.error,
+                    };
+                    if REQUESTS.try_send(request).is_err() {
+                        parser.damaged();
+                        UART_GENERATION.fetch_add(1, Ordering::Relaxed);
+                        UART_DAMAGED.store(true, Ordering::Relaxed);
+                        MAINTENANCE_CHANGED.signal(());
+                    }
+                }
+            }
+        }
+    };
+    #[cfg(not(feature = "uart-smoke"))]
+    let uart_tx_fut = async {
+        let mut wire = [0u8; 522];
+        loop {
+            let reply = UART_REPLIES.receive().await;
+            if let Source::Uart { number, .. } = reply.source {
+                if let Some(len) =
+                    uart_link::encode_reply(number, &reply.bytes[..reply.len], &mut wire)
+                {
+                    debug_packet(true, &wire[..len]);
+                    if uart_tx.write(&wire[..len]).await.is_err() {
+                        unsafe { debug_add(core::ptr::addr_of_mut!(nrf_uart_debug.tx_errors), 1); }
+                        UART_GENERATION.fetch_add(1, Ordering::Relaxed);
+                        UART_DAMAGED.store(true, Ordering::Relaxed);
+                        MAINTENANCE_CHANGED.signal(());
+                    } else {
+                        unsafe { debug_add(core::ptr::addr_of_mut!(nrf_uart_debug.tx_bytes), len as u32); }
+                        unsafe { debug_add(core::ptr::addr_of_mut!(nrf_uart_debug.tx_frames), 1); }
+                    }
+                }
+            }
+        }
+    };
 
     let usb_fut = usb.run();
     let serial_fut = async {
@@ -211,10 +747,19 @@ async fn main(_spawner: Spawner) {
         let mut staging = [0u8; 68];
 
         loop {
-            class.wait_connection().await;
-            let _ = write_reply(&mut class, READY_BANNER).await;
+            cdc_rx.wait_connection().await;
+            while !CDC_ACTIVE.load(Ordering::Relaxed) {
+                Timer::after(Duration::from_millis(1)).await;
+            }
+            let session = CDC_SESSION.load(Ordering::Relaxed);
+            let session_fut = async {
+            loop {
+                if MAINTENANCE_READY.wait().await == session { break; }
+            }
+            let _ = write_reply(&mut cdc_tx, READY_BANNER).await;
 
             let mut line_len = 0usize;
+            let mut discard_line = false;
             let mut upload_active = false;
             let mut upload_size = 0usize;
             let mut upload_received = 0usize;
@@ -222,55 +767,9 @@ async fn main(_spawner: Spawner) {
             let mut staging_len = 0usize;
 
             loop {
-                let n = if unifying.connected && !upload_active {
-                    // Race the next host command against a keep-alive tick.
-                    // Unifying keeps the link alive with periodic keep-alive
-                    // packets (like a real keyboard); without them the receiver
-                    // drops channel sync within a couple of seconds and the next
-                    // keystroke fails. tick() only actually transmits when the
-                    // keep-alive interval has elapsed, so an 8ms poll mirrors the
-                    // real keyboard cadence cheaply (most ticks are no-ops).
-                    match select(
-                        class.read_packet(&mut packet),
-                        Timer::after(Duration::from_millis(8)),
-                    )
-                    .await
-                    {
-                        Either::First(Ok(n)) => n,
-                        Either::First(Err(_)) => break,
-                        Either::Second(_) => {
-                            // Idle backoff: increase the keep-alive timeout when
-                            // no keystrokes are active. This tells the receiver
-                            // to poll us less frequently, freeing time slots for
-                            // other devices (e.g. the mouse).
-                            let idle_ms = Instant::now()
-                                .duration_since(unifying.last_activity)
-                                .as_millis();
-                            unifying.device.timeout = if idle_ms > 500 {
-                                110
-                            } else {
-                                20
-                            };
-                            let _ = unifying.device.tick();
-                            // Check for power failure warning — emergency save.
-                            if pac::POWER.events_pofwarn().read() != 0 {
-                                pac::POWER.events_pofwarn().write_value(0);
-                                if unifying.paired {
-                                    storage::save(
-                                        &flash,
-                                        unifying.active_slot,
-                                        &unifying.current_profile(),
-                                    );
-                                }
-                            }
-                            continue;
-                        }
-                    }
-                } else {
-                    match class.read_packet(&mut packet).await {
-                        Ok(n) => n,
-                        Err(_) => break,
-                    }
+                let n = match cdc_rx.read_packet(&mut packet).await {
+                    Ok(n) => n,
+                    Err(_) => break,
                 };
 
                 if upload_active {
@@ -284,11 +783,12 @@ async fn main(_spawner: Spawner) {
                             .is_err()
                         {
                             upload_active = false;
+                            UPLOAD_ACTIVE.store(false, Ordering::Relaxed);
                             upload_size = 0;
                             upload_received = 0;
                             image_ready = false;
                             staging_len = 0;
-                            let _ = write_reply(&mut class, b"ERR WRITE\r\n").await;
+                            let _ = write_reply(&mut cdc_tx, b"ERR WRITE\r\n").await;
                             continue;
                         }
                         upload_received += aligned_len;
@@ -306,11 +806,12 @@ async fn main(_spawner: Spawner) {
                             padded[..staging_len].copy_from_slice(&staging[..staging_len]);
                             if updater.write_firmware(upload_received, &padded).is_err() {
                                 upload_active = false;
+                                UPLOAD_ACTIVE.store(false, Ordering::Relaxed);
                                 upload_size = 0;
                                 upload_received = 0;
                                 image_ready = false;
                                 staging_len = 0;
-                                let _ = write_reply(&mut class, b"ERR WRITE\r\n").await;
+                                let _ = write_reply(&mut cdc_tx, b"ERR WRITE\r\n").await;
                                 continue;
                             }
                             upload_received += staging_len;
@@ -318,8 +819,9 @@ async fn main(_spawner: Spawner) {
                         }
 
                         upload_active = false;
+                        UPLOAD_ACTIVE.store(false, Ordering::Relaxed);
                         image_ready = true;
-                        let _ = write_reply(&mut class, b"OK\r\n").await;
+                        let _ = write_reply(&mut cdc_tx, b"OK\r\n").await;
                     }
 
                     continue;
@@ -329,11 +831,16 @@ async fn main(_spawner: Spawner) {
                     if b == b'\n' {
                         let consumed_line_len = line_len;
                         line_len = 0;
+                        if discard_line {
+                            discard_line = false;
+                            let _ = write_reply(&mut cdc_tx, b"ERR ARG\r\n").await;
+                            continue;
+                        }
 
                         // OTA commands first (kept byte-for-byte compatible).
                         match parse_ota_command(&line[..consumed_line_len]) {
                             Some(OtaCommand::Ping) => {
-                                let _ = write_reply(&mut class, b"PONG\r\n").await;
+                                let _ = write_reply(&mut cdc_tx, b"PONG\r\n").await;
                                 continue;
                             }
                             Some(OtaCommand::Info) => {
@@ -344,67 +851,100 @@ async fn main(_spawner: Spawner) {
                                     Ok(BootState::DfuDetach) => INFO_DFU,
                                     Err(_) => INFO_ERR,
                                 };
-                                let _ = write_reply(&mut class, resp).await;
+                                let _ = write_reply(&mut cdc_tx, resp).await;
                                 continue;
                             }
                             Some(OtaCommand::Write(size)) => {
+                                if UART_OTA_ACTIVE.load(Ordering::Relaxed) {
+                                    let _ = write_reply(&mut cdc_tx, b"ERR BUSY\r\n").await;
+                                    continue;
+                                }
                                 if size == 0 || size > ACTIVE_IMAGE_LIMIT {
-                                    let _ = write_reply(&mut class, b"ERR SIZE\r\n").await;
+                                    let _ = write_reply(&mut cdc_tx, b"ERR SIZE\r\n").await;
                                 } else {
                                     upload_active = true;
+                                    UPLOAD_ACTIVE.store(true, Ordering::Relaxed);
                                     upload_size = size;
                                     upload_received = 0;
                                     staging_len = 0;
                                     image_ready = false;
-                                    let _ = write_reply(&mut class, b"READY\r\n").await;
+                                    let _ = write_reply(&mut cdc_tx, b"READY\r\n").await;
                                 }
                                 continue;
                             }
                             Some(OtaCommand::Boot) => {
+                                if UART_OTA_ACTIVE.load(Ordering::Relaxed) {
+                                    let _ = write_reply(&mut cdc_tx, b"ERR BUSY\r\n").await;
+                                    continue;
+                                }
                                 if !image_ready {
-                                    let _ = write_reply(&mut class, b"ERR NOIMAGE\r\n").await;
+                                    let _ = write_reply(&mut cdc_tx, b"ERR NOIMAGE\r\n").await;
                                 } else if updater.mark_updated().is_err() {
-                                    let _ = write_reply(&mut class, b"ERR MARK\r\n").await;
+                                    let _ = write_reply(&mut cdc_tx, b"ERR MARK\r\n").await;
                                 } else {
-                                    let _ = write_reply(&mut class, b"REBOOT\r\n").await;
-                                    Timer::after(Duration::from_millis(100)).await;
-                                    SCB::sys_reset();
+                                    REBOOT_REQUESTED.signal(());
+                                    let _ = write_reply(&mut cdc_tx, b"REBOOT\r\n").await;
                                 }
                                 continue;
                             }
                             Some(OtaCommand::Abort) => {
                                 upload_active = false;
+                                UPLOAD_ACTIVE.store(false, Ordering::Relaxed);
                                 image_ready = false;
                                 staging_len = 0;
-                                let _ = write_reply(&mut class, b"ABORTED\r\n").await;
+                                let _ = write_reply(&mut cdc_tx, b"ABORTED\r\n").await;
                                 continue;
                             }
                             Some(OtaCommand::Reboot) => {
-                                let _ = write_reply(&mut class, b"REBOOT\r\n").await;
-                                Timer::after(Duration::from_millis(100)).await;
-                                SCB::sys_reset();
+                                REBOOT_REQUESTED.signal(());
+                                let _ = write_reply(&mut cdc_tx, b"REBOOT\r\n").await;
                             }
                             None => {}
                         }
 
-                        // Otherwise, handle Unifying commands.
-                        handle_unifying_command(
-                            &mut class,
-                            &mut unifying,
-                            &flash,
-                            &line[..consumed_line_len],
-                        )
-                        .await;
-                    } else if b != b'\r' && line_len < line.len() {
-                        line[line_len] = b;
-                        line_len += 1;
+                        if consumed_line_len == 0 { continue; }
+                        let mut request = Request {
+                            source: Source::Cdc(session), line: [0; 256],
+                            len: consumed_line_len, error: None,
+                        };
+                        request.line[..consumed_line_len]
+                            .copy_from_slice(&line[..consumed_line_len]);
+                        REQUESTS.send(request).await;
+                        loop {
+                            let reply = CDC_REPLIES.receive().await;
+                            if matches!(reply.source, Source::Cdc(epoch) if epoch == session) {
+                                let _ = write_reply(&mut cdc_tx, &reply.bytes[..reply.len]).await;
+                                break;
+                            }
+                        }
+                    } else if b != b'\r' && !discard_line {
+                        if line_len == line.len() {
+                            discard_line = true;
+                        } else {
+                            line[line_len] = b;
+                            line_len += 1;
+                        }
                     }
                 }
             }
+            };
+            // DTR loss cancels endpoint writes and waits even if the host never reads.
+            let _ = select(session_ended(session), session_fut).await;
+            UPLOAD_ACTIVE.store(false, Ordering::Relaxed);
+            while CDC_REPLIES.try_receive().is_ok() {}
         }
     };
 
-    join(usb_fut, serial_fut).await;
+    let reboot_fut = async {
+        REBOOT_REQUESTED.wait().await;
+        // Allow the reply to reach the host; DTR loss cannot cancel this timer.
+        Timer::after(Duration::from_millis(100)).await;
+        SCB::sys_reset();
+    };
+
+    join(reboot_fut, join(usb_fut, join(control_fut,
+        join(worker_fut, join(serial_fut, join(uart_rx_fut, uart_tx_fut))),
+    ))).await;
 }
 
 enum OtaCommand {
@@ -436,6 +976,27 @@ fn parse_ota_command(line: &[u8]) -> Option<OtaCommand> {
     }
 }
 
+#[cfg(feature = "uart-smoke")]
+async fn handle_unifying_command(
+    sink: &mut ReplySink,
+    _state: &mut UnifyingState,
+    _flash: &SharedFlash<'_>,
+    line: &[u8],
+) {
+    if line.is_empty() { return; }
+    if line == b"VER" {
+        let _ = sink.write(VERSION_REPLY).await;
+    } else if line == b"UARTTEST" && matches!(sink.reply.source, Source::Cdc(_)) {
+        let mut out = [0u8; 192];
+        if let Ok(n) = uart_smoke::format_response(uart_smoke::snapshot(), &mut out) {
+            let _ = sink.write(&out[..n]).await;
+        }
+    } else {
+        // Never invoke any RF operation, including radio self-tests, in this build.
+        let _ = sink.write(b"ERR DIAGNOSTIC\r\n").await;
+    }
+}
+
 /// Handle one Unifying CDC command line.
 ///
 /// Protocol (ASCII, `\n`-terminated):
@@ -450,8 +1011,9 @@ fn parse_ota_command(line: &[u8]) -> Option<OtaCommand> {
 /// - `USTATUS`            report state; `STATUS PAIRED=.. CONN=.. CH=.. CNT=..`
 /// - `UDELETE`            erase the stored pairing; `DELETED`
 /// - unknown              prints the command list
-async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
-    class: &mut CdcAcmClass<'d, Driver<'d, V>>,
+#[cfg(not(feature = "uart-smoke"))]
+async fn handle_unifying_command(
+    sink: &mut ReplySink,
     state: &mut UnifyingState,
     flash: &SharedFlash<'_>,
     line: &[u8],
@@ -467,7 +1029,7 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
         // The receiver must be in pairing mode (e.g. `sudo ltunify pair 60`).
         // The winning encoding is whichever scores ACKs.
         if state.device.configure_radio().is_err() {
-            let _ = write_reply(class, b"ERR RADIO\r\n").await;
+            let _ = sink.write(b"ERR RADIO\r\n").await;
             return;
         }
 
@@ -495,9 +1057,9 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
 
             let mut out = [0u8; 48];
             let n = format_radiotest(&mut out, enc, acks);
-            let _ = write_reply(class, &out[..n]).await;
+            let _ = sink.write(&out[..n]).await;
         }
-        let _ = write_reply(class, b"RADIOTEST DONE\r\n").await;
+        let _ = sink.write(b"RADIOTEST DONE\r\n").await;
         return;
     }
 
@@ -507,7 +1069,7 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
             match parse_u8_hex(&line[6..]) {
                 Some(s) if s < MAX_PROFILES => s,
                 _ => {
-                    let _ = write_reply(class, b"ERR SLOT\r\n").await;
+                    let _ = sink.write(b"ERR SLOT\r\n").await;
                     return;
                 }
             }
@@ -525,8 +1087,10 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
             name: b"RustKbd",
         };
 
+        // pair() rewrites address/key/channel as it goes; keep the old link to restore on failure.
+        let previous = state.paired.then(|| (state.current_profile(), state.connected));
         if state.device.configure_radio().is_err() {
-            let _ = write_reply(class, b"ERR RADIO\r\n").await;
+            let _ = sink.write(b"ERR RADIO\r\n").await;
             return;
         }
 
@@ -552,20 +1116,25 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
             storage::save_active_slot(flash, slot);
             let mut out = [0u8; 64];
             let n = format_paired(&mut out, &state.device.address, state.device.channel);
-            let _ = write_reply(class, &out[..n]).await;
+            let _ = sink.write(&out[..n]).await;
         } else {
-            let _ = write_reply(class, b"ERR PAIR\r\n").await;
+            // A failed re-pair must leave the existing target usable, not half-overwritten.
+            if let Some((profile, connected)) = previous {
+                state.apply_profile(&profile);
+                state.connected = connected && state.device.configure_radio().is_ok();
+            }
+            let _ = sink.write(b"ERR PAIR\r\n").await;
         }
         return;
     }
 
     if line == b"UCONNECT" {
         if !state.paired {
-            let _ = write_reply(class, b"ERR NOTPAIRED\r\n").await;
+            let _ = sink.write(b"ERR NOTPAIRED\r\n").await;
             return;
         }
         if state.device.configure_radio().is_err() {
-            let _ = write_reply(class, b"ERR RADIO\r\n").await;
+            let _ = sink.write(b"ERR RADIO\r\n").await;
             return;
         }
         let mut ok = false;
@@ -580,20 +1149,20 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
             state.connected = true;
             let mut out = [0u8; 32];
             let n = format_connected(&mut out, state.device.channel);
-            let _ = write_reply(class, &out[..n]).await;
+            let _ = sink.write(&out[..n]).await;
         } else {
-            let _ = write_reply(class, b"ERR CONNECT\r\n").await;
+            let _ = sink.write(b"ERR CONNECT\r\n").await;
         }
         return;
     }
 
     if line == b"UKEEPALIVE" {
         if !state.connected {
-            let _ = write_reply(class, b"ERR NOTCONN\r\n").await;
+            let _ = sink.write(b"ERR NOTCONN\r\n").await;
             return;
         }
         let _ = state.device.tick();
-        let _ = write_reply(class, b"TICK\r\n").await;
+        let _ = sink.write(b"TICK\r\n").await;
         return;
     }
 
@@ -611,23 +1180,19 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
                 storage::save(flash, state.active_slot, &state.current_profile());
             }
         }
-        let _ = write_reply(class, b"SLEEP\r\n").await;
+        let _ = sink.write(b"SLEEP\r\n").await;
         return;
     }
 
     if line == b"USTATUS" {
         let mut out = [0u8; 96];
         let n = format_status(&mut out, state);
-        let _ = write_reply(class, &out[..n]).await;
+        let _ = sink.write(&out[..n]).await;
         return;
     }
 
     if line == b"VER" {
-        let _ = write_reply(
-            class,
-            concat!("VER unifying/1 build=", env!("BUILD_TIME"), "\r\n").as_bytes(),
-        )
-        .await;
+        let _ = sink.write(VERSION_REPLY).await;
         return;
     }
 
@@ -641,17 +1206,17 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
                         state.paired = false;
                         state.connected = false;
                     }
-                    let _ = write_reply(class, b"DELETED\r\n").await;
+                    let _ = sink.write(b"DELETED\r\n").await;
                 }
                 _ => {
-                    let _ = write_reply(class, b"ERR SLOT\r\n").await;
+                    let _ = sink.write(b"ERR SLOT\r\n").await;
                 }
             }
         } else {
             storage::clear_all(flash);
             state.paired = false;
             state.connected = false;
-            let _ = write_reply(class, b"DELETED ALL\r\n").await;
+            let _ = sink.write(b"DELETED ALL\r\n").await;
         }
         return;
     }
@@ -670,20 +1235,20 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
                     if state.device.configure_radio().is_ok() {
                         state.connected = true;
                     } else {
-                        let _ = write_reply(class, b"ERR RADIO\r\n").await;
+                        let _ = sink.write(b"ERR RADIO\r\n").await;
                         return;
                     }
                     let mut out = [0u8; 48];
                     let n = format_switched(&mut out, slot, true);
-                    let _ = write_reply(class, &out[..n]).await;
+                    let _ = sink.write(&out[..n]).await;
                 } else {
                     let mut out = [0u8; 48];
                     let n = format_switched_empty(&mut out, slot);
-                    let _ = write_reply(class, &out[..n]).await;
+                    let _ = sink.write(&out[..n]).await;
                 }
             }
             _ => {
-                let _ = write_reply(class, b"ERR SLOT\r\n").await;
+                let _ = sink.write(b"ERR SLOT\r\n").await;
             }
         }
         return;
@@ -695,7 +1260,7 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
     // Example: UKEY 05 4C  -> Ctrl(01)+Alt(04) + Delete(0x4C)  => Ctrl+Alt+Del
     if let Some(rest) = line.strip_prefix(b"UKEY ") {
         if !state.connected {
-            let _ = write_reply(class, b"ERR NOTCONN\r\n").await;
+            let _ = sink.write(b"ERR NOTCONN\r\n").await;
             return;
         }
         state.last_activity = Instant::now();
@@ -704,7 +1269,7 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
         let modifier = match tokens.next().and_then(parse_u8_hex) {
             Some(m) => m,
             None => {
-                let _ = write_reply(class, b"ERR ARG\r\n").await;
+                let _ = sink.write(b"ERR ARG\r\n").await;
                 return;
             }
         };
@@ -728,7 +1293,7 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
             }
         }
         if bad {
-            let _ = write_reply(class, b"ERR ARG\r\n").await;
+            let _ = sink.write(b"ERR ARG\r\n").await;
             return;
         }
         for _ in 0..5 {
@@ -738,7 +1303,7 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
         if state.paired {
             storage::save(flash, state.active_slot, &state.current_profile());
         }
-        let _ = write_reply(class, if ok { b"OK\r\n" } else { b"ERR SEND\r\n" }).await;
+        let _ = sink.write(if ok { b"OK\r\n" } else { b"ERR SEND\r\n" }).await;
         return;
     }
 
@@ -748,7 +1313,7 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
     // set of currently-held keys, and a final `UKEYDOWN 00` acts as all-up.
     if let Some(rest) = line.strip_prefix(b"UKEYDOWN ") {
         if !state.connected {
-            let _ = write_reply(class, b"ERR NOTCONN\r\n").await;
+            let _ = sink.write(b"ERR NOTCONN\r\n").await;
             return;
         }
         state.last_activity = Instant::now();
@@ -757,7 +1322,7 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
         let modifier = match tokens.next().and_then(parse_u8_hex) {
             Some(m) => m,
             None => {
-                let _ = write_reply(class, b"ERR ARG\r\n").await;
+                let _ = sink.write(b"ERR ARG\r\n").await;
                 return;
             }
         };
@@ -781,7 +1346,7 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
             }
         }
         if bad {
-            let _ = write_reply(class, b"ERR ARG\r\n").await;
+            let _ = sink.write(b"ERR ARG\r\n").await;
             return;
         }
         // Send only the press — no release. The KVM sends the next state
@@ -792,13 +1357,13 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
         if state.paired && state.device.aes_counter & 0x7F == 0 {
             storage::save(flash, state.active_slot, &state.current_profile());
         }
-        let _ = write_reply(class, if ok { b"OK\r\n" } else { b"ERR SEND\r\n" }).await;
+        let _ = sink.write(if ok { b"OK\r\n" } else { b"ERR SEND\r\n" }).await;
         return;
     }
 
     if let Some(text) = line.strip_prefix(b"UTYPE ") {
         if !state.connected {
-            let _ = write_reply(class, b"ERR NOTCONN\r\n").await;
+            let _ = sink.write(b"ERR NOTCONN\r\n").await;
             return;
         }
         state.last_activity = Instant::now();
@@ -822,7 +1387,7 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
         }
         let mut out = [0u8; 48];
         let n = format_typed(&mut out, ok_count, total);
-        let _ = write_reply(class, &out[..n]).await;
+        let _ = sink.write(&out[..n]).await;
         // The AES counter advanced with each keystroke. Persist it so a reset
         // resumes from a fresh value the receiver hasn't seen (replay defense).
         if state.paired {
@@ -831,10 +1396,7 @@ async fn handle_unifying_command<'d, V: VbusDetect + 'd>(
         return;
     }
 
-    let _ = write_reply(
-        class,
-        b"UCMDS: VER UPAIR [slot] UCONNECT UTYPE <text> UKEY <mod> [keys] UKEYDOWN <mod> [keys] USWITCH <slot> USLEEP UKEEPALIVE USTATUS UDELETE [slot]\r\n",
-    )
+    let _ = sink.write(b"UCMDS: VER UPAIR [slot] UCONNECT UTYPE <text> UKEY <mod> [keys] UKEYDOWN <mod> [keys] USWITCH <slot> USLEEP UKEEPALIVE USTATUS UDELETE [slot]\r\n",)
     .await;
 }
 
@@ -862,8 +1424,7 @@ fn type_char(device: &mut Device, c: u8) -> bool {
 /// bitmask (bit0=LCtrl, bit1=LShift, bit2=LAlt, bit3=LGui, ...). Returns true
 /// if the press was acknowledged by the receiver.
 ///
-/// The link is kept fresh by the background keep-alive woven into the serial
-/// loop, so a single send attempt is normally enough.
+/// The radio worker maintains the link independently of either transport.
 fn send_key_report(device: &mut Device, keys: &[u8; KEYS_LEN], modifier: u8) -> bool {
     let pressed = press_key(device, keys, modifier);
     cortex_m::asm::delay(640_000); // ~10ms hold before release
@@ -1075,7 +1636,7 @@ fn format_switched_empty(out: &mut [u8], slot: u8) -> usize {
 }
 
 async fn write_reply<'d, V: VbusDetect + 'd>(
-    class: &mut CdcAcmClass<'d, Driver<'d, V>>,
+    class: &mut Sender<'d, Driver<'d, V>>,
     data: &[u8],
 ) -> Result<(), Disconnected> {
     let mut offset = 0usize;
@@ -1083,6 +1644,9 @@ async fn write_reply<'d, V: VbusDetect + 'd>(
         let end = (offset + 64).min(data.len());
         class.write_packet(&data[offset..end]).await?;
         offset = end;
+    }
+    if !data.is_empty() && data.len() % 64 == 0 {
+        class.write_packet(&[]).await?;
     }
     Ok(())
 }

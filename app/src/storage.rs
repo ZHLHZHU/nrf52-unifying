@@ -142,7 +142,10 @@ pub fn save(flash: &SharedFlash, slot: u8, profile: &Profile) {
                 return;
             }
             if decode(&rec).is_none() {
-                next = i;
+                // Invalid is not necessarily erased (factory data or a torn write).
+                // NOR programming cannot restore zero bits. Rewrite this page
+                // from the caller's current profile instead of corrupting the log.
+                next = if rec.iter().all(|&byte| byte == 0xff) { i } else { SLOTS_PER_PAGE };
                 break;
             }
         }
@@ -221,8 +224,8 @@ pub fn save_active_slot(flash: &SharedFlash, slot: u8) {
             }
             let val = u32::from_le_bytes(buf);
             if val >= MAX_PROFILES as u32 {
-                // Erased or invalid — this is the next free entry.
-                next = i;
+                // Only all-one bits are free; dirty entries require an erase.
+                next = if val == u32::MAX { i } else { ACTIVE_ENTRIES };
                 break;
             }
         }
