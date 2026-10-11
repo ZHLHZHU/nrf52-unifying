@@ -52,7 +52,7 @@ use embassy_futures::select::{select, Either};
 use embassy_nrf::nvmc::Nvmc;
 use embassy_nrf::usb::vbus_detect::{HardwareVbusDetect, VbusDetect};
 use embassy_nrf::usb::Driver;
-use embassy_nrf::{bind_interrupts, pac, peripherals, usb, uarte};
+use embassy_nrf::{bind_interrupts, buffered_uarte, pac, peripherals, usb, uarte};
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::{channel::Channel, signal::Signal};
@@ -76,7 +76,7 @@ use unifying_hal::{EmbassyClock, SwAesCtr};
 bind_interrupts!(struct Irqs {
     USBD => usb::InterruptHandler<peripherals::USBD>;
     CLOCK_POWER => usb::vbus_detect::InterruptHandler;
-    UARTE0 => uarte::InterruptHandler<peripherals::UARTE0>;
+    UARTE0 => buffered_uarte::InterruptHandler<peripherals::UARTE0>;
 });
 
 const ACTIVE_IMAGE_LIMIT: usize = 480 * 1024;
@@ -107,6 +107,10 @@ struct UnifyingState {
     active_slot: u8,
     /// Last keystroke activity timestamp — used for idle timeout backoff.
     last_activity: Instant,
+    /// Whether the receiver of the active slot answered our last transmission. While `false`
+    /// (searching) the background keep-alive hops channels; key reports only probe once so every
+    /// UART command finishes in bounded time instead of blocking ~1.4s on an unreachable target.
+    link_up: bool,
 }
 
 impl UnifyingState {
@@ -128,6 +132,7 @@ impl UnifyingState {
             connected: false,
             active_slot: 0,
             last_activity: Instant::now(),
+            link_up: false,
         }
     }
 
@@ -139,6 +144,7 @@ impl UnifyingState {
         self.device.channel = p.channel;
         self.paired = true;
         self.connected = false;
+        self.link_up = false;
     }
 
     /// Snapshot the current pairing for persistence.
@@ -162,6 +168,7 @@ impl UnifyingState {
             storage::save(flash, self.active_slot, &self.current_profile());
         }
         self.connected = false;
+        self.link_up = false;
         self.active_slot = slot;
         storage::save_active_slot(flash, slot);
         if let Some(profile) = storage::load(flash, slot) {
@@ -325,7 +332,14 @@ fn poll_radio(state: &mut UnifyingState, flash: &SharedFlash<'_>) {
     if state.connected && !UPLOAD_ACTIVE.load(Ordering::Relaxed) && !UART_OTA_ACTIVE.load(Ordering::Relaxed) {
         let idle_ms = Instant::now().duration_since(state.last_activity).as_millis();
         state.device.timeout = if idle_ms > 500 { 110 } else { 20 };
-        let _ = state.device.tick();
+        // tick() is Ok both when nothing was due and when a frame was ACKed; only a new transmit
+        // timestamp proves the receiver heard us.
+        let before = state.device.previous_transmit;
+        match state.device.tick() {
+            Ok(()) if state.device.previous_transmit != before => state.link_up = true,
+            Err(_) => state.link_up = false,
+            Ok(()) => {}
+        }
     }
     // A polled warning, not a measured power-loss guarantee.
     if pac::POWER.events_pofwarn().read() != 0 {
@@ -411,17 +425,23 @@ async fn main(_spawner: Spawner) {
     }
     }
 
-    // User-confirmed nice!nano-compatible mapping, derived from the v2 schematic:
-    // P0.02 (002/D19) RX and P0.06 (006/D1) TX are the lowest free exposed GPIOs.
-    // https://nicekeyboards.com/docs/nice-nano/pinout-schematic/
+    // Board wiring (docs/BOARD-KVM.md): P0.06 RX ← RP GP4, P0.08 TX → RP GP5.
     let mut uart_config = uarte::Config::default();
     uart_config.baudrate = uarte::Baudrate::BAUD1M;
     uart_config.parity = uarte::Parity::EXCLUDED;
-    let uart = uarte::Uarte::new(p.UARTE0, p.P0_06, p.P0_08, Irqs, uart_config);
+    // Continuous ring-buffered RX. The plain Uarte only receives while a read future is polled, so
+    // lines arriving while the worker blocks on the radio (or across a select) were silently lost:
+    // the RP then timed out with no reply. 1 KiB holds ~10ms at 1 Mbaud; TX is one reply at a time.
+    static mut UART_RX_BUF: [u8; 1024] = [0; 1024];
+    static mut UART_TX_BUF: [u8; 600] = [0; 600];
+    let uart = buffered_uarte::BufferedUarte::new(
+        p.UARTE0, p.TIMER0, p.PPI_CH0, p.PPI_CH1, p.PPI_GROUP0, p.P0_06, p.P0_08, Irqs, uart_config,
+        unsafe { &mut *core::ptr::addr_of_mut!(UART_RX_BUF) },
+        unsafe { &mut *core::ptr::addr_of_mut!(UART_TX_BUF) },
+    );
     // Keep RX idle high while the Pico resets or its TX is disconnected.
     pac::P0.pin_cnf(6).modify(|w| w.set_pull(pac::gpio::vals::Pull::PULLUP));
-    let (mut uart_tx, mut uart_rx) =
-        uart.split_with_idle(p.TIMER0, p.PPI_CH0, p.PPI_CH1);
+    let (mut uart_rx, mut uart_tx) = uart.split();
     let (mut cdc_tx, mut cdc_rx, cdc_control) = class.split_with_control();
 
     let control_fut = async {
@@ -566,10 +586,11 @@ async fn main(_spawner: Spawner) {
                     let _ = CDC_REPLIES.try_send(sink.reply);
                 }
                 Source::Uart { .. } => {
-                    if UART_REPLIES.try_send(sink.reply).is_err() {
-                        UART_GENERATION.fetch_add(1, Ordering::Relaxed);
-                        UART_DAMAGED.store(true, Ordering::Relaxed);
-                    }
+                    // The TX task drains one reply while the next is queued; back-to-back requests
+                    // (the RP abandons and re-sends) used to overflow this capacity-1 channel and
+                    // silently discard every queued request. The RP keeps at most a few lines in
+                    // flight, so waiting for TX here is bounded by a single ~0.5ms frame.
+                    UART_REPLIES.send(sink.reply).await;
                 }
                 _ => {}
             }
@@ -611,7 +632,7 @@ async fn main(_spawner: Spawner) {
         let mut parser = uart_smoke::Parser::new();
         let mut packet = [0u8; 256];
         loop {
-            match uart_rx.read_until_idle(&mut packet).await {
+            match uart_rx.read(&mut packet).await {
                 Ok(n) => {
                     uart_smoke::received_bytes(n);
                     for &byte in &packet[..n] {
@@ -624,9 +645,6 @@ async fn main(_spawner: Spawner) {
                     }
                 }
                 Err(_) => {
-                    // Embassy returns no length on error; EasyDMA still reports received bytes.
-                    let n = pac::UARTE0.dma().rx().amount().read().0 as usize;
-                    uart_smoke::received_bytes(n);
                     uart_smoke::uart_error();
                     if parser.damaged() { uart_smoke::bad_frame(); }
                 }
@@ -641,10 +659,12 @@ async fn main(_spawner: Spawner) {
         loop {
             Timer::at(deadline).await;
             let wire = uart_smoke::encode_ping(sequence);
-            match uart_tx.write(&wire).await {
-                Ok(()) => uart_smoke::transmitted_frame(),
-                Err(_) => uart_smoke::uart_error(),
+            let mut sent = 0;
+            let mut ok = true;
+            while sent < wire.len() {
+                match uart_tx.write(&wire[sent..]).await { Ok(n) => sent += n, Err(_) => { ok = false; break; } }
             }
+            if ok { uart_smoke::transmitted_frame(); } else { uart_smoke::uart_error(); }
             sequence = sequence.wrapping_add(1);
             // No CDC DTR, maintenance or upload state gates either diagnostic UART task.
             while deadline <= Instant::now() { deadline += interval; }
@@ -656,26 +676,17 @@ async fn main(_spawner: Spawner) {
         let mut packet = [0u8; 256];
         let mut parser_session = CDC_SESSION.load(Ordering::Relaxed);
         loop {
-            // Both session publishers run on this executor. Consume any old wake
-            // before taking the epoch for the new DMA read.
+            // Both session publishers run on this executor. Consume any old wake first.
             UART_SESSION_CHANGED.reset();
             let read_session = CDC_SESSION.load(Ordering::Relaxed);
             if read_session != parser_session {
                 parser.session_changed(&[]);
                 parser_session = read_session;
             }
-            let result = select(
-                UART_SESSION_CHANGED.wait(), uart_rx.read_until_idle(&mut packet),
-            ).await;
+            // The ring keeps receiving in hardware; a session change only resets the parser.
+            let result = select(UART_SESSION_CHANGED.wait(), uart_rx.read(&mut packet)).await;
             let n = match result {
-                Either::First(_) => {
-                    // Dropping Embassy's read stops DMA and waits for ENDRX.
-                    let n = pac::UARTE0.dma().rx().amount().read().0 as usize;
-                    pac::UARTE0.events_dma().rx().ready().write_value(0);
-                    parser.session_changed(&packet[..n]);
-                    parser_session = CDC_SESSION.load(Ordering::Relaxed);
-                    continue;
-                }
+                Either::First(_) => continue,
                 Either::Second(Err(_)) => {
                     unsafe { debug_add(core::ptr::addr_of_mut!(nrf_uart_debug.rx_errors), 1); }
                     parser.damaged();
@@ -726,7 +737,16 @@ async fn main(_spawner: Spawner) {
                     uart_link::encode_reply(number, &reply.bytes[..reply.len], &mut wire)
                 {
                     debug_packet(true, &wire[..len]);
-                    if uart_tx.write(&wire[..len]).await.is_err() {
+                    // BufferedUarteTx::write may accept a prefix; push the whole frame.
+                    let mut sent = 0;
+                    let mut failed = false;
+                    while sent < len {
+                        match uart_tx.write(&wire[sent..len]).await {
+                            Ok(n) => sent += n,
+                            Err(_) => { failed = true; break; }
+                        }
+                    }
+                    if failed {
                         unsafe { debug_add(core::ptr::addr_of_mut!(nrf_uart_debug.tx_errors), 1); }
                         UART_GENERATION.fetch_add(1, Ordering::Relaxed);
                         UART_DAMAGED.store(true, Ordering::Relaxed);
@@ -1110,6 +1130,7 @@ async fn handle_unifying_command(
         if paired {
             state.paired = true;
             state.connected = true;
+            state.link_up = true;
             state.active_slot = slot;
             // Persist the new pairing into the specified slot.
             storage::save(flash, slot, &state.current_profile());
@@ -1147,6 +1168,7 @@ async fn handle_unifying_command(
         }
         if ok {
             state.connected = true;
+            state.link_up = true;
             let mut out = [0u8; 32];
             let n = format_connected(&mut out, state.device.channel);
             let _ = sink.write(&out[..n]).await;
@@ -1351,7 +1373,7 @@ async fn handle_unifying_command(
         }
         // Send only the press — no release. The KVM sends the next state
         // (or UKEYDOWN 00) when keys change.
-        let ok = press_key(&mut state.device, &keys, modifier);
+        let ok = send_report(state, &keys, modifier);
         // Periodic save: every 128 keystrokes persist the counter to limit
         // the gap on unexpected power loss (startup +512 covers the rest).
         if state.paired && state.device.aes_counter & 0x7F == 0 {
@@ -1430,6 +1452,24 @@ fn send_key_report(device: &mut Device, keys: &[u8; KEYS_LEN], modifier: u8) -> 
     cortex_m::asm::delay(640_000); // ~10ms hold before release
     release_keys(device);
     pressed
+}
+
+/// Bounded KVM key-report send driven by the link state. Up: up to three channel attempts
+/// (each 16 tries with ≤1.5ms gaps, ~35ms; ~110ms worst case). Searching: one probe (~35ms);
+/// the 8ms keep-alive keeps hunting between UART commands.
+/// Either way the UART reply never waits on a long channel scan, so the RP can abandon a request
+/// without a hidden backlog building up behind it.
+fn send_report(state: &mut UnifyingState, keys: &[u8; KEYS_LEN], modifier: u8) -> bool {
+    let attempts = if state.link_up { 3 } else { 1 };
+    for _ in 0..attempts {
+        // Each failure already advances the channel inside the protocol layer.
+        if state.device.send_encrypted_keystroke(keys, modifier).is_ok() {
+            state.link_up = true;
+            return true;
+        }
+    }
+    state.link_up = false;
+    false
 }
 
 /// Transmit a key-press report, retrying across channels. Returns true on ACK.

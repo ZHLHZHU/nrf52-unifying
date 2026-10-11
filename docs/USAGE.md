@@ -333,11 +333,15 @@ python3 tools/unifying.py ver
 
 ## 8. RP2040 UART 与维护模式
 
-新增 UART 入口不改变 Unifying/ESB 算法、配对存储格式或原 CDC/OTA 线协议。无线状态现在由一个 worker 持有；UART 和 CDC 通过容量 8 的请求队列进入该 worker，各有独立容量 1 的回复队列。worker 不等待 CDC 输出，8ms 绝对保活截止时间在每条命令前检查，不依赖 CDC 连接或 DTR。原空闲 timeout 20/110 和 POFWARN 保存保留；POFWARN 是轮询，未测掉电余量。
+新增 UART 入口不改变 Unifying/ESB 算法、配对存储格式或原 CDC/OTA 线协议。无线状态现在由一个 worker 持有；UART 和 CDC 通过容量 8 的请求队列进入该 worker，各有独立容量 1 的回复队列。UART 回复入队时 worker 等待发送任务取走（每帧约 0.5ms），不再在队列满时丢弃回复并废弃后续请求。worker 不等待 CDC 输出，8ms 绝对保活截止时间在每条命令前检查，不依赖 CDC 连接或 DTR。原空闲 timeout 20/110 和 POFWARN 保存保留；POFWARN 是轮询，未测掉电余量。
+
+UARTE0 使用 `BufferedUarte`（1 KiB RX 环形缓冲，硬件持续接收）。普通 `Uarte` 只在读 future 被轮询时接收，worker 阻塞发射频的约 100ms 内到达的后续行会丢失，RP 因此 UART 超时。
+
+`UKEYDOWN` 按链路状态限时：`link_up`（最近一次发送或保活被接收器 ACK）时最多换 3 个信道尝试，搜索中只试 1 次立即回 `ERR SEND`，由后台 8ms 保活继续跳频。每条命令最坏约 0.1 秒回复，不再在一条命令里阻塞约 1.4 秒。
 
 ### 信号与帧
 
-官方 nice!nano v2 pin map、用户确认的兼容板配置：UARTE0 RX=P0.02（`002`/D19），TX=P0.06（`006`/D1），1,000,000 baud、8N1、无硬件流控。Pico GP4 TX → nRF RX，Pico GP5 RX ← nRF TX，两侧共地，使用 3.3V IO。正常与诊断模式均启用 RX 上拉，防止 Pico reset 或断开 TX 时 RX 浮空。双向完整 UART 消息已实测；电压/波形仍待测，不把芯片/USB 枚举当作 UART 证明。
+当前一体板：UARTE0 RX=P0.06（`006`），TX=P0.08（`008`），1,000,000 baud、8N1、无硬件流控（开发板时代为 RX=P0.02、TX=P0.06）。RP GP4 TX → nRF RX，RP GP5 RX ← nRF TX，两侧共地，使用 3.3V IO。正常与诊断模式均启用 RX 上拉，防止 RP reset 或断开 TX 时 RX 浮空。
 
 ```text
 @00000001 VER<LF>
